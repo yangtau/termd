@@ -1,0 +1,17 @@
+[package]
+name = "termd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+cosmic-text = "0.19.0"
+crossterm = "0.29.0"
+flate2 = "1.1.11"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+libc = "0.2.191"
+pulldown-cmark = "0.13.6"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+tiny-skia = "0.12.0"
