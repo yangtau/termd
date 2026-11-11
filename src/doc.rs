@@ -1,79 +1,105 @@
 //! Markdown → laid-out page → pixels.
 //!
-//! `Engine::layout` walks the Markdown events once and produces a `Doc`: a
-//! flat list of positioned draw items (text buffers, rectangles, images) on a
-//! page of fixed pixel width. `Doc::render` rasterizes any horizontal strip
-//! of that page, which is what lets the viewer upload the page tile by tile.
+//! A `Doc` is a page of fixed pixel width: a flat list of positioned draw
+//! items (text buffers, rectangles, images). It is built incrementally:
+//! `Doc::new` only parses the Markdown, and `Doc::advance` lays out as many
+//! blocks as the caller asks for, so the first screen can be shown before the
+//! rest of a long document has been shaped. `Doc::render` rasterizes any
+//! horizontal strip of what has been laid out so far, which is what lets the
+//! viewer upload the page tile by tile.
+//!
+//! The page image covers only the text column, not the full terminal width,
+//! and its background is transparent unless the theme asks for a page color.
 
-use crate::theme::{Rgb, Theme};
+use crate::fonts::{Fonts, Installed};
+use crate::highlight::{Highlighter, Token};
+use crate::theme::{Rgb, Rgba, Theme};
 use cosmic_text::{
-    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight,
-    Wrap,
+    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent,
+    SwashImage, Weight, Wrap,
 };
 use image::RgbaImage;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
-use syntect::util::LinesWithEndings;
+use std::time::Instant;
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
-/// Glyph metadata tag marking inline code, used to paint its background.
+/// Glyph metadata flags: inline code (gets a background) and struck-through
+/// text. cosmic-text has its own strikethrough, but it loses the decoration
+/// on runs that use a different font than the paragraph's first one.
 const META_CODE: usize = 1;
+const META_STRIKE: usize = 2;
 
-const HEADING_SCALE: [f32; 6] = [2.0, 1.5, 1.25, 1.0, 0.875, 0.85];
-const BODY_LINE: f32 = 1.6;
+const HEADING_SCALE: [f32; 6] = [1.85, 1.45, 1.2, 1.0, 0.9, 0.85];
+const BODY_LINE: f32 = 1.65;
 const HEADING_LINE: f32 = 1.3;
-const CODE_SCALE: f32 = 0.875;
-const CODE_LINE: f32 = 1.5;
+const CODE_SCALE: f32 = 0.88;
+const CODE_LINE: f32 = 1.55;
 /// Content column width limit, in em.
 const MAX_WIDTH_EM: f32 = 46.0;
+const REGULAR: u16 = 400;
+/// Headings and strong text. Semibold where the font has it (SF, PingFang).
+const BOLD: u16 = 600;
 
-/// Long-lived rendering state: fonts, glyph cache, syntax definitions and
-/// decoded images. Expensive to create, reused across re-layouts.
+/// Long-lived rendering state: fonts, glyph cache, highlighted code and
+/// decoded images. Reused across re-layouts.
 pub struct Engine {
     fs: FontSystem,
+    fonts: Fonts,
     swash: SwashCache,
-    syntaxes: SyntaxSet,
-    themes: ThemeSet,
+    highlighter: Highlighter,
     images: HashMap<PathBuf, Option<RgbaImage>>,
-    sans: Option<String>,
-    mono: Option<String>,
 }
 
-pub struct LayoutOpts<'a> {
-    /// Page width in pixels.
+pub struct LayoutOpts {
+    /// Page width in pixels (the terminal width, or `--width` for export).
     pub page_w: u32,
     /// Body font size in pixels.
     pub font_px: f32,
     /// Directory relative image paths are resolved against.
-    pub base_dir: &'a Path,
-    pub theme: &'a Theme,
+    pub base_dir: PathBuf,
+    pub theme: Theme,
 }
 
 pub struct Doc {
+    /// Width of the page image in pixels.
     pub width: u32,
-    pub height: u32,
-    bg: Rgb,
-    link: Rgb,
-    /// How far above/below its box an item may paint (glyph overhang).
-    slack: f32,
-    items: Vec<Item>,
+    /// Where the left edge of the image sits on the page.
+    pub origin_x: u32,
+    /// Height laid out so far; final once `done()`.
+    height: u32,
+    events: std::vec::IntoIter<Event<'static>>,
+    lay: Layout,
+    done: bool,
+}
+
+/// A reading position that survives a re-layout at another size.
+#[derive(Clone, Copy)]
+pub struct Anchor {
+    /// Parser event that produced the block.
+    src: u32,
+    /// Which of that event's blocks (a table produces one per cell).
+    nth: u32,
+    /// Position inside the block, as a fraction of its height.
+    frac: f32,
 }
 
 struct Item {
     y: f32,
     h: f32,
+    src: u32,
     kind: Kind,
 }
 
 enum Kind {
-    Text { x: f32, buf: Buffer, color: Rgb },
-    Rect { x: f32, w: f32, radius: f32, color: Rgb },
+    Text { x: f32, buf: Buffer, color: Rgba },
+    /// Filled rectangle; `radii` are the corner radii clockwise from top-left.
+    Rect { x: f32, w: f32, radii: [f32; 4], color: Rgba },
+    /// Rounded rectangle outline drawn inside the box.
+    Outline { x: f32, w: f32, radius: f32, line: f32, color: Rgba },
     Image { x: f32, img: RgbaImage },
-    Check { x: f32, checked: bool, border: Rgb },
+    Check { x: f32 },
 }
 
 #[derive(Clone, Default)]
@@ -83,69 +109,117 @@ struct Span {
     italic: bool,
     strike: bool,
     code: bool,
-    color: Option<Rgb>,
+    color: Option<Rgba>,
 }
 
-struct TextStyle<'a> {
+struct TextStyle {
     size: f32,
     line_h: f32,
     mono: bool,
-    bold: bool,
-    sans_family: Family<'a>,
-    mono_family: Family<'a>,
+    weight: u16,
 }
 
-fn text_style<'a>(
-    sans: &'a Option<String>,
-    mono: &'a Option<String>,
-    size: f32,
-    line_scale: f32,
-) -> TextStyle<'a> {
-    TextStyle {
-        size,
-        line_h: (size * line_scale).round(),
-        mono: false,
-        bold: false,
-        sans_family: sans.as_deref().map_or(Family::SansSerif, Family::Name),
-        mono_family: mono.as_deref().map_or(Family::Monospace, Family::Name),
+fn text_style(size: f32, line_scale: f32) -> TextStyle {
+    TextStyle { size, line_h: (size * line_scale).round(), mono: false, weight: REGULAR }
+}
+
+/// Text style of code blocks.
+fn code_style(em: f32) -> TextStyle {
+    TextStyle { mono: true, ..text_style((em * CODE_SCALE).round(), CODE_LINE) }
+}
+
+/// Horizontal and vertical padding inside a code block.
+fn code_pad(em: f32) -> (f32, f32) {
+    ((1.1 * em).round(), (0.85 * em).round())
+}
+
+fn code_spans(tokens: &[Token], theme: &Theme) -> Vec<Span> {
+    let variant = if theme.dark { 0 } else { 1 };
+    tokens
+        .iter()
+        .map(|t| Span { text: t.text.clone(), color: t.colors[variant].map(Rgb::opaque), ..Span::default() })
+        .collect()
+}
+
+fn color(c: Rgba) -> Color {
+    Color::rgba(c.0, c.1, c.2, c.3)
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x2E80..=0x9FFF      // radicals, kana, CJK punctuation, ideographs
+        | 0xAC00..=0xD7AF    // hangul
+        | 0xF900..=0xFAFF    // compatibility ideographs
+        | 0xFE30..=0xFE4F    // CJK compatibility forms
+        | 0xFF00..=0xFFEF    // fullwidth forms
+        | 0x20000..=0x3FFFF) // ideograph extensions
+}
+
+/// Split `text` into maximal runs of CJK and non-CJK characters. Whitespace
+/// stays with the run it follows.
+fn script_runs(text: &str) -> Vec<(&str, bool)> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    let mut current: Option<bool> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            continue;
+        }
+        let cjk = is_cjk(c);
+        match current {
+            Some(cur) if cur != cjk => {
+                runs.push((&text[start..i], cur));
+                start = i;
+                current = Some(cjk);
+            }
+            None => current = Some(cjk),
+            _ => {}
+        }
     }
+    if start < text.len() {
+        runs.push((&text[start..], current.unwrap_or(false)));
+    }
+    runs
 }
 
-fn color(c: Rgb) -> Color {
-    Color::rgb(c.0, c.1, c.2)
-}
-
-fn make_buffer(fs: &mut FontSystem, spans: &[Span], st: &TextStyle, width: Option<f32>) -> Buffer {
-    let mut buf = Buffer::new(fs, Metrics::new(st.size, st.line_h));
+fn make_buffer(eng: &mut Engine, spans: &[Span], st: &TextStyle, width: Option<f32>) -> Buffer {
+    let fonts = &eng.fonts;
+    let mut buf = Buffer::new(&mut eng.fs, Metrics::new(st.size, st.line_h));
     buf.set_wrap(Wrap::WordOrGlyph);
     buf.set_size(width, None);
-    let base = Attrs::new()
-        .family(if st.mono { st.mono_family } else { st.sans_family })
-        .weight(if st.bold { Weight::BOLD } else { Weight::NORMAL });
-    let rich = spans.iter().map(|s| {
-        let mut a = base.clone();
-        if s.bold {
-            a = a.weight(Weight::BOLD);
+
+    // Every run names its family and a weight that family has, so
+    // cosmic-text never needs to go looking for a fallback font.
+    let attrs = |cjk: bool, mono: bool, weight: u16| {
+        let fam = match (&fonts.cjk, cjk, mono) {
+            (Some(cjk_fam), true, _) => cjk_fam,
+            (_, _, true) => &fonts.mono,
+            _ => &fonts.sans,
+        };
+        Attrs::new().family(Family::Name(&fam.name)).weight(Weight(fam.weight(weight)))
+    };
+    let base = attrs(false, st.mono, st.weight);
+    let mut rich = Vec::new();
+    for s in spans {
+        let weight = if s.bold { BOLD.max(st.weight) } else { st.weight };
+        for (piece, cjk) in script_runs(&s.text) {
+            let mut a = attrs(cjk, st.mono || s.code, weight);
+            if s.italic {
+                a = a.style(Style::Italic);
+            }
+            let flags = if s.code { META_CODE } else { 0 } | if s.strike { META_STRIKE } else { 0 };
+            a = a.metadata(flags);
+            if s.code {
+                a = a.metrics(Metrics::new(st.size * CODE_SCALE, st.line_h));
+            }
+            if let Some(c) = s.color {
+                a = a.color(color(c));
+            }
+            rich.push((piece, a));
         }
-        if s.italic {
-            a = a.style(Style::Italic);
-        }
-        if s.strike {
-            a = a.strikethrough();
-        }
-        if s.code {
-            a = a
-                .family(st.mono_family)
-                .metadata(META_CODE)
-                .metrics(Metrics::new(st.size * 0.88, st.line_h));
-        }
-        if let Some(c) = s.color {
-            a = a.color(color(c));
-        }
-        (s.text.as_str(), a)
-    });
+    }
     buf.set_rich_text(rich, &base, Shaping::Advanced, None);
-    buf.shape_until_scroll(fs, false);
+    buf.shape_until_scroll(&mut eng.fs, false);
     buf
 }
 
@@ -156,13 +230,9 @@ fn measure(buf: &Buffer) -> (f32, f32) {
     })
 }
 
-fn is_cjk(c: char) -> bool {
-    matches!(c as u32,
-        0x2E80..=0x9FFF      // radicals, kana, CJK punctuation, ideographs
-        | 0xAC00..=0xD7AF    // hangul
-        | 0xF900..=0xFAFF    // compatibility ideographs
-        | 0xFF00..=0xFFEF    // fullwidth forms
-        | 0x20000..=0x3FFFF) // ideograph extensions
+/// Baseline of the first line, from the top of the buffer.
+fn baseline(buf: &Buffer) -> Option<f32> {
+    buf.layout_runs().next().map(|run| run.line_y)
 }
 
 fn is_blank(spans: &[Span]) -> bool {
@@ -170,16 +240,10 @@ fn is_blank(spans: &[Span]) -> bool {
 }
 
 impl Engine {
-    pub fn new(sans: Option<String>, mono: Option<String>) -> Engine {
-        Engine {
-            fs: FontSystem::new(),
-            swash: SwashCache::new(),
-            syntaxes: SyntaxSet::load_defaults_newlines(),
-            themes: ThemeSet::load_defaults(),
-            images: HashMap::new(),
-            sans,
-            mono,
-        }
+    /// `installed` is the result of `fonts::scan`.
+    pub fn new(installed: Installed, highlighter: Highlighter, sans: Option<&str>, mono: Option<&str>) -> Engine {
+        let (fs, fonts) = Fonts::new(installed, sans, mono);
+        Engine { fs, fonts, swash: SwashCache::new(), highlighter, images: HashMap::new() }
     }
 
     /// Forget decoded images so edited files are picked up on reload.
@@ -187,65 +251,15 @@ impl Engine {
         self.images.clear();
     }
 
-    pub fn layout(&mut self, markdown: &str, opts: &LayoutOpts) -> Doc {
-        let theme = opts.theme;
-        let em = opts.font_px;
-        let page_w = opts.page_w as f32;
-        let content_w = (page_w - 2.4 * em).min(MAX_WIDTH_EM * em).max(4.0 * em);
-        let left = ((page_w - content_w) / 2.0).max(0.0).round();
-        let hl_name = if theme.dark { "base16-ocean.dark" } else { "InspiredGitHub" };
+    /// Forget rasterized glyphs; call when the font size changes.
+    pub fn clear_glyph_cache(&mut self) {
+        self.swash = SwashCache::new();
+    }
 
-        let mut b = Builder {
-            fs: &mut self.fs,
-            syntaxes: &self.syntaxes,
-            hl_theme: &self.themes.themes[hl_name],
-            images: &mut self.images,
-            sans: &self.sans,
-            mono: &self.mono,
-            theme,
-            base_dir: opts.base_dir,
-            em,
-            x: left,
-            right: left + content_w,
-            y: (1.5 * em).round(),
-            margin: 0.0,
-            first: true,
-            items: Vec::new(),
-            spans: Vec::new(),
-            bold: 0,
-            italic: 0,
-            strike: 0,
-            link: 0,
-            heading: None,
-            lists: Vec::new(),
-            marker: None,
-            quotes: Vec::new(),
-            code: None,
-            html: None,
-            image: None,
-            table: None,
-            in_meta: false,
-            soft_break: false,
-        };
-
-        let options = Options::ENABLE_TABLES
-            | Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_TASKLISTS
-            | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-        for event in Parser::new_ext(markdown, options) {
-            b.event(event);
-        }
-        b.flush_inline(false);
-
-        let height = (b.y + 2.0 * em).ceil() as u32;
-        Doc {
-            width: opts.page_w,
-            height,
-            bg: theme.bg,
-            link: theme.link,
-            slack: em * 2.0,
-            items: b.items,
-        }
+    /// The families in use, for `TERMD_DEBUG`.
+    pub fn font_names(&self) -> String {
+        let cjk = self.fonts.cjk.as_ref().map_or("none", |f| f.name.as_str());
+        format!("sans={:?} mono={:?} cjk={:?}", self.fonts.sans.name, self.fonts.mono.name, cjk)
     }
 }
 
@@ -262,16 +276,20 @@ struct Table {
     head_rows: usize,
 }
 
-struct Builder<'e> {
-    fs: &'e mut FontSystem,
-    syntaxes: &'e SyntaxSet,
-    hl_theme: &'e syntect::highlighting::Theme,
-    images: &'e mut HashMap<PathBuf, Option<RgbaImage>>,
-    sans: &'e Option<String>,
-    mono: &'e Option<String>,
-    theme: &'e Theme,
-    base_dir: &'e Path,
+/// Layout state carried between `Doc::advance` calls.
+/// A code block laid out before its highlighting was ready.
+struct Uncolored {
+    /// Index of its text in `Layout::items`.
+    item: usize,
+    lang: String,
+    code: String,
+    /// Wrap width of its text.
+    width: f32,
+}
 
+struct Layout {
+    theme: Theme,
+    base_dir: PathBuf,
     em: f32,
     /// Left edge of the current block (moves right inside lists and quotes).
     x: f32,
@@ -281,7 +299,13 @@ struct Builder<'e> {
     /// Bottom margin of the last placed block (collapses with the next top margin).
     margin: f32,
     first: bool,
+    /// Everything above this is final: no later item will be drawn there.
+    stable: f32,
+    /// Number of parser events consumed.
+    src: u32,
     items: Vec<Item>,
+    /// Code blocks waiting for their colors, in document order.
+    uncolored: VecDeque<Uncolored>,
 
     spans: Vec<Span>,
     bold: u32,
@@ -293,6 +317,9 @@ struct Builder<'e> {
     lists: Vec<Option<u64>>,
     /// Marker waiting to be drawn next to the next placed block.
     marker: Option<Marker>,
+    /// Baseline of the first line of the block about to be placed, so a
+    /// list number can sit on the same baseline as its text.
+    lead: Option<f32>,
     /// Open block quotes: bar x and the y where their content started.
     quotes: Vec<(f32, Option<f32>)>,
     /// Open code block: (language, text).
@@ -306,11 +333,223 @@ struct Builder<'e> {
     soft_break: bool,
 }
 
-impl Builder<'_> {
-    fn event(&mut self, event: Event) {
+fn parse(markdown: &str) -> Vec<Event<'static>> {
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+    Parser::new_ext(markdown, options).map(Event::into_static).collect()
+}
+
+/// Language of a fenced code block's info string.
+fn code_lang(kind: &CodeBlockKind) -> String {
+    match kind {
+        CodeBlockKind::Fenced(info) => {
+            info.split(|c: char| c == ',' || c.is_whitespace()).next().unwrap_or("").to_string()
+        }
+        CodeBlockKind::Indented => String::new(),
+    }
+}
+
+/// The text of a code block as it is displayed and highlighted.
+fn code_text(raw: &str) -> &str {
+    raw.strip_suffix('\n').unwrap_or(raw)
+}
+
+/// The (language, code) of every fenced code block, in document order.
+fn code_blocks(events: &[Event]) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut open: Option<(String, String)> = None;
+    for event in events {
         match event {
-            Event::Start(tag) => self.start(tag),
-            Event::End(tag) => self.end(tag),
+            Event::Start(Tag::CodeBlock(kind)) => open = Some((code_lang(kind), String::new())),
+            Event::Text(t) => {
+                if let Some((_, code)) = &mut open {
+                    code.push_str(t);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some((lang, code)) = open.take() {
+                    blocks.push((lang, code_text(&code).to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// Start highlighting the code blocks of `markdown` in the background, so
+/// the work overlaps with the rest of startup.
+pub fn prepare_highlighting(highlighter: &mut Highlighter, markdown: &str) {
+    highlighter.prepare(code_blocks(&parse(markdown)));
+}
+
+impl Doc {
+    /// Parse `markdown`. Nothing is laid out until `advance` is called.
+    pub fn new(eng: &mut Engine, markdown: &str, opts: LayoutOpts) -> Doc {
+        eng.fonts.cover(&mut eng.fs, markdown);
+
+        let em = opts.font_px;
+        let page_w = opts.page_w as f32;
+        let content_w = (page_w - 2.4 * em).min(MAX_WIDTH_EM * em).max(4.0 * em).round();
+        // Room for things that hang slightly outside the column, such as the
+        // padding of inline code at the start of a line. A page with its own
+        // background color gets a proper margin instead.
+        let bleed = (if opts.theme.page.is_some() { 1.2 } else { 0.5 } * em).ceil();
+        let width = (content_w + 2.0 * bleed).min(page_w.max(1.0));
+        let origin_x = ((page_w - width) / 2.0).max(0.0).floor();
+
+        let events = parse(markdown);
+        eng.highlighter.prepare(code_blocks(&events));
+
+        let top = (1.5 * em).round();
+        Doc {
+            width: width as u32,
+            origin_x: origin_x as u32,
+            height: 0,
+            events: events.into_iter(),
+            done: false,
+            lay: Layout {
+                theme: opts.theme,
+                base_dir: opts.base_dir,
+                em,
+                x: bleed,
+                right: bleed + content_w,
+                y: top,
+                margin: 0.0,
+                first: true,
+                stable: 0.0,
+                src: 0,
+                items: Vec::new(),
+                uncolored: VecDeque::new(),
+                spans: Vec::new(),
+                bold: 0,
+                italic: 0,
+                strike: 0,
+                link: 0,
+                heading: None,
+                lists: Vec::new(),
+                marker: None,
+                lead: None,
+                quotes: Vec::new(),
+                code: None,
+                html: None,
+                image: None,
+                table: None,
+                in_meta: false,
+                soft_break: false,
+            },
+        }
+    }
+
+    /// Lay out more of the document: until `until` pixels are final, until
+    /// `deadline` passes, or to the end if neither is given.
+    pub fn advance(&mut self, eng: &mut Engine, until: Option<u32>, deadline: Option<Instant>) {
+        while !self.done {
+            if until.is_some_and(|y| self.height >= y) || deadline.is_some_and(|d| Instant::now() >= d) {
+                return;
+            }
+            match self.events.next() {
+                Some(event) => {
+                    self.lay.event(eng, event);
+                    self.lay.src += 1;
+                    self.height = self.lay.stable.floor() as u32;
+                }
+                None => {
+                    self.lay.flush_inline(eng, false);
+                    self.height = (self.lay.y + 2.0 * self.lay.em).ceil() as u32;
+                    self.done = true;
+                }
+            }
+        }
+    }
+
+    /// Whether some laid-out code block is still shown without colors.
+    pub fn awaits_highlight(&self) -> bool {
+        !self.lay.uncolored.is_empty()
+    }
+
+    /// Color the code blocks whose tokens have arrived since they were laid
+    /// out, working until `deadline`; without one, wait for all of them.
+    /// Returns the page ranges `(top, bottom)` that changed and must be
+    /// rendered again.
+    pub fn highlight(&mut self, eng: &mut Engine, deadline: Option<Instant>) -> Vec<(u32, u32)> {
+        let lay = &mut self.lay;
+        let mut changed = Vec::new();
+        // Blocks are highlighted in document order, which is also the order
+        // of this queue, so the first one that is not ready ends the pass.
+        while let Some(block) = lay.uncolored.front() {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+            let tokens = match deadline {
+                None => eng.highlighter.get(&block.lang, &block.code),
+                Some(_) => match eng.highlighter.try_get(&block.lang, &block.code) {
+                    Some(tokens) => tokens,
+                    None => break,
+                },
+            };
+            let Some(block) = lay.uncolored.pop_front() else { break };
+            let Some(tokens) = tokens else { continue }; // unknown language: stays plain
+            let colored = make_buffer(eng, &code_spans(&tokens, &lay.theme), &code_style(lay.em), Some(block.width));
+            let item = &mut lay.items[block.item];
+            // Colors must not move anything; if they somehow would (the
+            // text wraps differently), the block stays as it is.
+            if let Kind::Text { buf, .. } = &mut item.kind
+                && measure(&colored).1 == measure(buf).1
+            {
+                *buf = colored;
+                changed.push((item.y.floor() as u32, (item.y + item.h).ceil() as u32));
+            }
+        }
+        changed
+    }
+
+    /// Height that can be rendered: everything laid out so far.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Whether the whole document has been laid out.
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
+    fn blocks(&self) -> impl Iterator<Item = &Item> {
+        self.lay.items.iter().filter(|i| matches!(i.kind, Kind::Text { .. } | Kind::Image { .. }))
+    }
+
+    /// The block at page offset `y`, to restore the position after a re-layout.
+    pub fn anchor(&self, y: u32) -> Option<Anchor> {
+        let y = y as f32;
+        let item = self
+            .blocks()
+            .filter(|i| i.y + i.h > y)
+            .min_by(|a, b| a.y.total_cmp(&b.y))?;
+        let nth = self
+            .blocks()
+            .filter(|i| i.src == item.src)
+            .position(|i| std::ptr::eq(i, item))?;
+        Some(Anchor { src: item.src, nth: nth as u32, frac: (y - item.y) / item.h.max(1.0) })
+    }
+
+    /// Page offset of `anchor` in this layout, laying out as far as needed.
+    pub fn resolve(&mut self, eng: &mut Engine, anchor: Anchor) -> u32 {
+        while !self.done && self.lay.src <= anchor.src {
+            let more = self.height + 1;
+            self.advance(eng, Some(more), None);
+        }
+        let found = self.blocks().filter(|i| i.src == anchor.src).nth(anchor.nth as usize);
+        found.map_or(0, |i| (i.y + anchor.frac * i.h).max(0.0) as u32)
+    }
+}
+
+impl Layout {
+    fn event(&mut self, eng: &mut Engine, event: Event) {
+        match event {
+            Event::Start(tag) => self.start(eng, tag),
+            Event::End(tag) => self.end(eng, tag),
             Event::Text(t) => self.text(&t, false),
             Event::Code(t) => self.text(&t, true),
             Event::InlineMath(t) | Event::DisplayMath(t) => self.text(&t, true),
@@ -318,7 +557,7 @@ impl Builder<'_> {
             Event::HardBreak => self.text("\n", false),
             Event::Html(t) => match &mut self.html {
                 Some(html) => html.push_str(&t),
-                None => self.html_block(&t),
+                None => self.html_block(eng, &t),
             },
             Event::InlineHtml(t) => {
                 if t.to_ascii_lowercase().starts_with("<br") {
@@ -326,51 +565,53 @@ impl Builder<'_> {
                 }
             }
             Event::Rule => {
-                self.flush_inline(true);
-                let h = (self.em * 0.12).max(2.0).round();
-                let y = self.place(h, 1.5 * self.em, 1.5 * self.em, h);
+                self.flush_inline(eng, true);
+                let h = self.hairline();
+                let y = self.place(eng, h, 1.6 * self.em, 1.6 * self.em, h);
                 self.rect(self.x, y, self.right - self.x, h, 0.0, self.theme.border);
             }
             Event::TaskListMarker(checked) => self.marker = Some(Marker::Task(checked)),
             Event::FootnoteReference(name) => self.text(&format!("[{name}]"), false),
         }
+        // Only a block quote draws above the current position after the
+        // fact (its bar), so outside of quotes everything placed is final.
+        if self.quotes.is_empty() {
+            self.stable = self.y;
+        }
     }
 
-    fn start(&mut self, tag: Tag) {
+    /// Thickness of rules and borders: one pixel, two on HiDPI screens.
+    fn hairline(&self) -> f32 {
+        (self.em / 14.0).round().max(1.0)
+    }
+
+    fn start(&mut self, eng: &mut Engine, tag: Tag) {
         match tag {
-            Tag::Paragraph => self.flush_inline(true),
+            Tag::Paragraph => self.flush_inline(eng, true),
             Tag::Heading { level, .. } => {
-                self.flush_inline(true);
+                self.flush_inline(eng, true);
                 self.heading = Some(level as usize);
             }
             Tag::BlockQuote(_) => {
-                self.flush_inline(true);
+                self.flush_inline(eng, true);
                 self.quotes.push((self.x, None));
                 self.x += 1.2 * self.em;
             }
             Tag::CodeBlock(kind) => {
-                self.flush_inline(true);
-                let lang = match kind {
-                    CodeBlockKind::Fenced(info) => info
-                        .split(|c: char| c == ',' || c.is_whitespace())
-                        .next()
-                        .unwrap_or("")
-                        .to_string(),
-                    CodeBlockKind::Indented => String::new(),
-                };
-                self.code = Some((lang, String::new()));
+                self.flush_inline(eng, true);
+                self.code = Some((code_lang(&kind), String::new()));
             }
             Tag::HtmlBlock => {
-                self.flush_inline(true);
+                self.flush_inline(eng, true);
                 self.html = Some(String::new());
             }
             Tag::List(start) => {
-                self.flush_inline(true);
+                self.flush_inline(eng, true);
                 self.lists.push(start);
-                self.x += 1.8 * self.em;
+                self.x += 1.7 * self.em;
             }
             Tag::Item => {
-                self.flush_inline(true);
+                self.flush_inline(eng, true);
                 self.marker = Some(match self.lists.last_mut() {
                     Some(Some(n)) => {
                         *n += 1;
@@ -380,7 +621,7 @@ impl Builder<'_> {
                 });
             }
             Tag::Table(aligns) => {
-                self.flush_inline(true);
+                self.flush_inline(eng, true);
                 self.table = Some(Table { aligns, rows: Vec::new(), row: Vec::new(), head_rows: 0 });
             }
             Tag::Emphasis => self.italic += 1,
@@ -393,45 +634,45 @@ impl Builder<'_> {
         }
     }
 
-    fn end(&mut self, tag: TagEnd) {
+    fn end(&mut self, eng: &mut Engine, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph => self.flush_inline(false),
+            TagEnd::Paragraph => self.flush_inline(eng, false),
             TagEnd::Heading(_) => {
-                self.flush_inline(false);
+                self.flush_inline(eng, false);
                 self.heading = None;
             }
             TagEnd::BlockQuote(_) => {
-                self.flush_inline(true);
+                self.flush_inline(eng, true);
                 self.x -= 1.2 * self.em;
                 if let Some((bar_x, Some(top))) = self.quotes.pop() {
-                    let w = (0.22 * self.em).max(2.0).round();
-                    self.rect(bar_x, top, w, self.y - top, 0.0, self.theme.quote_bar);
+                    let w = (0.2 * self.em).max(2.0).round();
+                    self.rect(bar_x, top, w, self.y - top, w / 2.0, self.theme.quote_bar);
                 }
             }
             TagEnd::CodeBlock => {
                 if let Some((lang, text)) = self.code.take() {
-                    self.code_block(&lang, &text);
+                    self.code_block(eng, &lang, &text);
                 }
             }
             TagEnd::HtmlBlock => {
                 if let Some(html) = self.html.take() {
-                    self.html_block(&html);
+                    self.html_block(eng, &html);
                 }
             }
             TagEnd::List(_) => {
-                self.flush_inline(true);
+                self.flush_inline(eng, true);
                 self.lists.pop();
-                self.x -= 1.8 * self.em;
+                self.x -= 1.7 * self.em;
                 if self.lists.is_empty() {
-                    self.margin = self.margin.max(0.8 * self.em);
+                    self.margin = self.margin.max(0.9 * self.em);
                 }
             }
             TagEnd::Item => {
-                self.flush_inline(true);
+                self.flush_inline(eng, true);
                 // An item with no content still gets its marker.
                 if self.marker.is_some() {
                     let line = (self.em * BODY_LINE).round();
-                    self.place(line, 0.25 * self.em, 0.25 * self.em, line);
+                    self.place(eng, line, 0.2 * self.em, 0.2 * self.em, line);
                 }
             }
             TagEnd::TableCell => {
@@ -451,7 +692,7 @@ impl Builder<'_> {
             }
             TagEnd::Table => {
                 if let Some(t) = self.table.take() {
-                    self.table_block(t);
+                    self.table_block(eng, t);
                 }
             }
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
@@ -460,7 +701,7 @@ impl Builder<'_> {
             TagEnd::Link => self.link = self.link.saturating_sub(1),
             TagEnd::Image => {
                 if let Some((dest, alt)) = self.image.take() {
-                    self.image_block(&dest, &alt);
+                    self.image_block(eng, &dest, &alt);
                 }
             }
             TagEnd::MetadataBlock(_) => self.in_meta = false,
@@ -497,13 +738,13 @@ impl Builder<'_> {
         }
     }
 
-    fn text_color(&self) -> Rgb {
+    fn text_color(&self) -> Rgba {
         if self.quotes.is_empty() { self.theme.fg } else { self.theme.dim }
     }
 
     /// Reserve vertical space for a block of height `h` and return its top.
     /// `first_line_h` positions a pending list marker next to the first line.
-    fn place(&mut self, h: f32, margin_top: f32, margin_bottom: f32, first_line_h: f32) -> f32 {
+    fn place(&mut self, eng: &mut Engine, h: f32, margin_top: f32, margin_bottom: f32, first_line_h: f32) -> f32 {
         let gap = if self.first { 0.0 } else { self.margin.max(margin_top) };
         let y = (self.y + gap).round();
         self.first = false;
@@ -512,38 +753,59 @@ impl Builder<'_> {
         for quote in &mut self.quotes {
             quote.1.get_or_insert(y);
         }
+        let lead = self.lead.take();
         if let Some(marker) = self.marker.take() {
-            self.draw_marker(marker, y, first_line_h);
+            self.draw_marker(eng, marker, y, first_line_h, lead);
         }
         y
     }
 
-    fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgb) {
-        self.items.push(Item { y, h, kind: Kind::Rect { x, w, radius, color } });
+    fn push(&mut self, y: f32, h: f32, kind: Kind) {
+        self.items.push(Item { y, h, src: self.src, kind });
     }
 
-    fn draw_marker(&mut self, marker: Marker, y: f32, line_h: f32) {
+    fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgba) {
+        self.push(y, h, Kind::Rect { x, w, radii: [radius; 4], color });
+    }
+
+    fn draw_marker(&mut self, eng: &mut Engine, marker: Marker, y: f32, line_h: f32, lead: Option<f32>) {
         let em = self.em;
+        let color = self.text_color();
         match marker {
+            // Disc, ring, square by nesting depth, like a browser.
             Marker::Bullet => {
-                let d = (0.34 * em).round().max(3.0);
-                self.rect(self.x - em, y + (line_h - d) / 2.0, d, d, d / 2.0, self.text_color());
+                let d = (0.32 * em).round().max(3.0);
+                let (x, y) = (self.x - 0.95 * em, y + ((line_h - d) / 2.0).round());
+                match self.lists.len() {
+                    0 | 1 => self.rect(x, y, d, d, d / 2.0, color),
+                    2 => {
+                        let line = (d * 0.22).max(1.0);
+                        self.push(y, d, Kind::Outline { x, w: d, radius: d / 2.0, line, color });
+                    }
+                    _ => self.rect(x, y, d, d, 0.0, color),
+                }
             }
             Marker::Number(n) => {
-                let st = text_style(self.sans, self.mono, em, BODY_LINE);
+                let st = text_style(em, BODY_LINE);
                 let span = Span { text: format!("{n}."), ..Span::default() };
-                let buf = make_buffer(self.fs, &[span], &st, None);
+                let buf = make_buffer(eng, &[span], &st, None);
                 let (w, h) = measure(&buf);
                 let x = self.x - 0.45 * em - w;
-                self.items.push(Item { y, h, kind: Kind::Text { x, buf, color: self.text_color() } });
+                // Lines with CJK glyphs have a slightly lower baseline than
+                // Latin-only ones; follow the text's.
+                let shift = lead.zip(baseline(&buf)).map_or(0.0, |(text, number)| (text - number).round());
+                self.push(y + shift, h, Kind::Text { x, buf, color });
             }
             Marker::Task(checked) => {
                 let s = (0.95 * em).round();
-                self.items.push(Item {
-                    y: y + ((line_h - s) / 2.0).round(),
-                    h: s,
-                    kind: Kind::Check { x: self.x - 1.45 * em, checked, border: self.theme.border },
-                });
+                let (x, y) = (self.x - 1.4 * em, y + ((line_h - s) / 2.0).round());
+                if checked {
+                    self.rect(x, y, s, s, s * 0.22, self.theme.accent);
+                    self.push(y, s, Kind::Check { x });
+                } else {
+                    let (line, color) = ((s * 0.09).max(1.0).round(), self.theme.quote_bar);
+                    self.push(y, s, Kind::Outline { x, w: s, radius: s * 0.22, line, color });
+                }
             }
         }
     }
@@ -551,7 +813,7 @@ impl Builder<'_> {
     /// Turn the accumulated inline spans into a paragraph or heading.
     /// `tight` is used for text that is not wrapped in a paragraph (tight
     /// list items), which gets smaller margins.
-    fn flush_inline(&mut self, tight: bool) {
+    fn flush_inline(&mut self, eng: &mut Engine, tight: bool) {
         if self.table.is_some() {
             return; // table cells collect their own spans
         }
@@ -560,35 +822,47 @@ impl Builder<'_> {
             return;
         }
         let em = self.em;
-        let (mut st, mt, mb) = match self.heading {
+        let (st, mt, mb) = match self.heading {
             Some(level) => {
-                let scale = HEADING_SCALE[level.clamp(1, 6) - 1];
-                let mut st = text_style(self.sans, self.mono, (em * scale).round(), HEADING_LINE);
-                st.bold = true;
-                (st, 1.5 * em, 0.9 * em)
+                let level = level.clamp(1, 6);
+                let mut st = text_style((em * HEADING_SCALE[level - 1]).round(), HEADING_LINE);
+                st.weight = BOLD;
+                let top = if level <= 2 { 2.0 } else { 1.6 };
+                (st, top * em, 0.8 * em)
             }
-            None if tight => (text_style(self.sans, self.mono, em, BODY_LINE), 0.25 * em, 0.25 * em),
-            None => (text_style(self.sans, self.mono, em, BODY_LINE), 0.8 * em, 0.8 * em),
+            None if tight => (text_style(em, BODY_LINE), 0.2 * em, 0.2 * em),
+            None => (text_style(em, BODY_LINE), 0.9 * em, 0.9 * em),
         };
-        st.mono = false;
-        let buf = make_buffer(self.fs, &spans, &st, Some(self.right - self.x));
+        let buf = make_buffer(eng, &spans, &st, Some(self.right - self.x));
         let (_, text_h) = measure(&buf);
 
         // h1/h2 get a rule underneath, like GitHub.
         let ruled = matches!(self.heading, Some(1 | 2));
-        let rule_gap = if ruled { (0.3 * em).round() } else { 0.0 };
-        let rule_h = if ruled { (em * 0.06).max(1.0).round() } else { 0.0 };
-        let y = self.place(text_h + rule_gap + rule_h, mt, mb, st.line_h);
+        let rule_gap = if ruled { (0.35 * em).round() } else { 0.0 };
+        let rule_h = if ruled { self.hairline() } else { 0.0 };
+        self.lead = baseline(&buf);
+        let y = self.place(eng, text_h + rule_gap + rule_h, mt, mb, st.line_h);
 
-        // Backgrounds behind inline code.
-        let code_h = (st.size * 1.3).round();
-        let pad = (st.size * 0.18).round();
+        self.code_boxes(&buf, self.x, y);
+        let color = if self.heading == Some(6) { self.theme.dim } else { self.text_color() };
+        self.push(y, text_h, Kind::Text { x: self.x, buf, color });
+        if ruled {
+            self.rect(self.x, y + text_h + rule_gap, self.right - self.x, rule_h, 0.0, self.theme.border);
+        }
+    }
+
+    /// Backgrounds behind the inline code of `buf`, whose top-left is at
+    /// (`x`, `y`). Pushed before the text so they end up underneath.
+    fn code_boxes(&mut self, buf: &Buffer, x: f32, y: f32) {
+        let size = buf.metrics().font_size;
+        let code_h = (size * 1.32).round();
+        let pad = (size * 0.2).round();
         let mut boxes: Vec<(f32, f32, f32)> = Vec::new(); // x0, x1, top
         for run in buf.layout_runs() {
             let top = run.line_top + ((run.line_height - code_h) / 2.0).round();
             let mut open: Option<(f32, f32)> = None;
             for g in run.glyphs {
-                if g.metadata == META_CODE {
+                if g.metadata & META_CODE != 0 {
                     let (x0, _) = open.unwrap_or((g.x, 0.0));
                     open = Some((x0.min(g.x), g.x + g.w));
                 } else if let Some((x0, x1)) = open.take() {
@@ -600,72 +874,62 @@ impl Builder<'_> {
             }
         }
         for (x0, x1, top) in boxes {
-            let (x, w) = (self.x + x0 - pad, x1 - x0 + 2.0 * pad);
-            self.rect(x, y + top, w, code_h, st.size * 0.22, self.theme.code_bg);
-        }
-
-        let color = if self.heading == Some(6) { self.theme.dim } else { self.text_color() };
-        self.items.push(Item { y, h: text_h, kind: Kind::Text { x: self.x, buf, color } });
-        if ruled {
-            self.rect(self.x, y + text_h + rule_gap, self.right - self.x, rule_h, 0.0, self.theme.border);
+            let (bx, w) = ((x + x0 - pad).round(), (x1 - x0 + 2.0 * pad).round());
+            self.rect(bx, y + top, w, code_h, size * 0.28, self.theme.code_bg);
         }
     }
 
-    fn code_block(&mut self, lang: &str, text: &str) {
-        let text = text.strip_suffix('\n').unwrap_or(text);
-        let syntax = self
-            .syntaxes
-            .find_syntax_by_token(lang)
-            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
-        let mut hl = HighlightLines::new(syntax, self.hl_theme);
-        let mut spans = Vec::new();
-        for line in LinesWithEndings::from(text) {
-            match hl.highlight_line(line, self.syntaxes) {
-                Ok(parts) => spans.extend(parts.into_iter().map(|(style, s)| Span {
-                    text: s.to_string(),
-                    color: Some(Rgb(style.foreground.r, style.foreground.g, style.foreground.b)),
-                    ..Span::default()
-                })),
-                Err(_) => spans.push(Span { text: line.to_string(), ..Span::default() }),
+    fn code_block(&mut self, eng: &mut Engine, lang: &str, text: &str) {
+        let text = code_text(text);
+        let plain = || vec![Span { text: text.to_string(), ..Span::default() }];
+        // Never wait for the highlighter: show the block now and let
+        // `Doc::highlight` color it once the tokens are there.
+        match eng.highlighter.try_get(lang, text) {
+            Some(Some(tokens)) => self.mono_block(eng, &code_spans(&tokens, &self.theme), self.theme.fg),
+            Some(None) => self.mono_block(eng, &plain(), self.theme.fg),
+            None => {
+                self.mono_block(eng, &plain(), self.theme.fg);
+                let width = self.right - self.x - 2.0 * code_pad(self.em).0;
+                self.uncolored.push_back(Uncolored {
+                    item: self.items.len() - 1,
+                    lang: lang.to_string(),
+                    code: text.to_string(),
+                    width,
+                });
             }
         }
-        self.mono_block(&spans, self.theme.fg);
     }
 
-    fn html_block(&mut self, html: &str) {
+    fn html_block(&mut self, eng: &mut Engine, html: &str) {
         let html = html.trim();
         if html.is_empty() || (html.starts_with("<!--") && html.ends_with("-->")) {
             return;
         }
         let span = Span { text: html.to_string(), ..Span::default() };
-        self.mono_block(&[span], self.theme.dim);
+        self.mono_block(eng, &[span], self.theme.dim);
     }
 
     /// A monospace block on a rounded background (code blocks, raw HTML).
-    fn mono_block(&mut self, spans: &[Span], fg: Rgb) {
+    /// Its text is the last item pushed.
+    fn mono_block(&mut self, eng: &mut Engine, spans: &[Span], fg: Rgba) {
         let em = self.em;
-        let mut st = text_style(self.sans, self.mono, (em * CODE_SCALE).round(), CODE_LINE);
-        st.mono = true;
-        let (pad_x, pad_y) = (em.round(), (0.8 * em).round());
+        let st = code_style(em);
+        let (pad_x, pad_y) = code_pad(em);
         let width = self.right - self.x;
-        let buf = make_buffer(self.fs, spans, &st, Some(width - 2.0 * pad_x));
+        let buf = make_buffer(eng, spans, &st, Some(width - 2.0 * pad_x));
         let (_, text_h) = measure(&buf);
         let text_h = text_h.max(st.line_h);
         let h = text_h + 2.0 * pad_y;
-        let y = self.place(h, 0.8 * em, 0.8 * em, (em * BODY_LINE).round());
-        self.rect(self.x, y, width, h, 0.4 * em, self.theme.code_bg);
-        self.items.push(Item {
-            y: y + pad_y,
-            h: text_h,
-            kind: Kind::Text { x: self.x + pad_x, buf, color: fg },
-        });
+        let y = self.place(eng, h, em, em, (em * BODY_LINE).round());
+        self.rect(self.x, y, width, h, (0.5 * em).round(), self.theme.code_bg);
+        self.push(y + pad_y, text_h, Kind::Text { x: self.x + pad_x, buf, color: fg });
     }
 
-    fn image_block(&mut self, dest: &str, alt: &str) {
+    fn image_block(&mut self, eng: &mut Engine, dest: &str, alt: &str) {
         let avail = self.right - self.x;
         // Images are authored in CSS pixels (16px body text); scale to ours.
         let scale = self.em / 16.0;
-        let scaled = self.load_image(dest).map(|src| {
+        let scaled = load_image(&mut eng.images, &self.base_dir, dest).map(|src| {
             let w = (src.width() as f32 * scale).min(avail).max(1.0);
             let h = (src.height() as f32 * w / src.width() as f32).max(1.0);
             let (w, h) = (w.round() as u32, h.round() as u32);
@@ -677,10 +941,10 @@ impl Builder<'_> {
         });
         match scaled {
             Some(img) if self.table.is_none() => {
-                self.flush_inline(true);
+                self.flush_inline(eng, true);
                 let h = img.height() as f32;
-                let y = self.place(h, 0.8 * self.em, 0.8 * self.em, (self.em * BODY_LINE).round());
-                self.items.push(Item { y, h, kind: Kind::Image { x: self.x, img } });
+                let y = self.place(eng, h, 0.9 * self.em, 0.9 * self.em, (self.em * BODY_LINE).round());
+                self.push(y, h, Kind::Image { x: self.x, img });
             }
             _ => {
                 // Remote, missing or undecodable: show a placeholder inline.
@@ -695,26 +959,15 @@ impl Builder<'_> {
         }
     }
 
-    fn load_image(&mut self, dest: &str) -> Option<&RgbaImage> {
-        if dest.contains("://") && !dest.starts_with("file://") {
-            return None;
-        }
-        let path = self.base_dir.join(dest.strip_prefix("file://").unwrap_or(dest));
-        self.images
-            .entry(path)
-            .or_insert_with_key(|p| image::open(p).ok().map(|i| i.to_rgba8()))
-            .as_ref()
-    }
-
-    fn table_block(&mut self, table: Table) {
+    fn table_block(&mut self, eng: &mut Engine, table: Table) {
         let cols = table.rows.iter().map(Vec::len).max().unwrap_or(0);
         if cols == 0 {
             return;
         }
         let em = self.em;
-        let (pad_x, pad_y, line) = ((0.8 * em).round(), (0.4 * em).round(), 1.0f32);
-        let st = text_style(self.sans, self.mono, em, 1.5);
-        let head_st = TextStyle { bold: true, ..text_style(self.sans, self.mono, em, 1.5) };
+        let (pad_x, pad_y, line) = ((0.9 * em).round(), (0.5 * em).round(), self.hairline());
+        let st = text_style(em, 1.5);
+        let head_st = TextStyle { weight: BOLD, ..text_style(em, 1.5) };
 
         // Pass 1: natural (unwrapped) width of every column.
         let mut cells: Vec<Vec<Buffer>> = Vec::new();
@@ -723,23 +976,17 @@ impl Builder<'_> {
             let style = if r < table.head_rows { &head_st } else { &st };
             let mut bufs = Vec::new();
             for (c, spans) in row.iter().enumerate() {
-                let buf = make_buffer(self.fs, spans, style, None);
+                let buf = make_buffer(eng, spans, style, None);
                 natural[c] = natural[c].max(measure(&buf).0.ceil() + 1.0);
                 bufs.push(buf);
             }
             cells.push(bufs);
         }
 
-        // Shrink columns proportionally if the table is wider than the page.
         let avail = self.right - self.x;
-        let chrome = cols as f32 * 2.0 * pad_x + (cols as f32 + 1.0) * line;
-        let total: f32 = natural.iter().sum();
+        let chrome = cols as f32 * 2.0 * pad_x;
         let room = (avail - chrome).max(cols as f32 * em);
-        let widths: Vec<f32> = if total <= room {
-            natural
-        } else {
-            natural.iter().map(|w| (w * room / total).floor().max(em)).collect()
-        };
+        let widths = fit_columns(&natural, room, em);
 
         // Pass 2: wrap to the final widths and measure row heights.
         let mut heights = Vec::new();
@@ -755,156 +1002,392 @@ impl Builder<'_> {
                     l.set_align(align);
                 }
                 buf.set_size(Some(widths[c]), None);
-                buf.shape_until_scroll(self.fs, false);
+                buf.shape_until_scroll(&mut eng.fs, false);
                 row_h = row_h.max(measure(buf).1);
             }
-            heights.push(row_h);
+            heights.push(row_h + 2.0 * pad_y);
         }
 
+        // Rows separated by hairlines inside a rounded frame; the header
+        // row is tinted.
+        let rows = heights.len() as f32;
         let table_w = widths.iter().sum::<f32>() + chrome;
-        let table_h = heights.iter().sum::<f32>()
-            + heights.len() as f32 * 2.0 * pad_y
-            + (heights.len() as f32 + 1.0) * line;
-        let y = self.place(table_h, 0.8 * em, 0.8 * em, st.line_h);
-
-        // The grid is the border-colored backdrop showing between cell fills.
-        self.rect(self.x, y, table_w, table_h, 0.0, self.theme.border);
+        let table_h = heights.iter().sum::<f32>() + (rows + 1.0) * line;
+        let radius = (0.45 * em).round();
+        let y = self.place(eng, table_h, em, em, st.line_h);
+        let head_h: f32 = heights[..table.head_rows].iter().sum::<f32>() + line;
+        if table.head_rows > 0 {
+            let radii = [radius, radius, 0.0, 0.0];
+            self.push(y, head_h, Kind::Rect { x: self.x, w: table_w, radii, color: self.theme.table_head });
+        }
         let color = self.text_color();
         let mut cy = y + line;
         for (r, row) in cells.into_iter().enumerate() {
-            let cell_h = heights[r] + 2.0 * pad_y;
-            let fill = if r < table.head_rows { self.theme.table_head } else { self.theme.bg };
-            let mut cx = self.x + line;
-            let mut row = row.into_iter();
-            for width in &widths {
-                let cell_w = width + 2.0 * pad_x;
-                self.rect(cx, cy, cell_w, cell_h, 0.0, fill);
-                if let Some(buf) = row.next() {
-                    self.items.push(Item {
-                        y: cy + pad_y,
-                        h: heights[r],
-                        kind: Kind::Text { x: cx + pad_x, buf, color },
-                    });
-                }
-                cx += cell_w + line;
+            if r > 0 {
+                self.rect(self.x, cy - line, table_w, line, 0.0, self.theme.border);
             }
-            cy += cell_h + line;
+            let mut cx = self.x;
+            for (buf, width) in row.into_iter().zip(&widths) {
+                self.code_boxes(&buf, cx + pad_x, cy + pad_y);
+                self.push(cy + pad_y, heights[r] - 2.0 * pad_y, Kind::Text { x: cx + pad_x, buf, color });
+                cx += width + 2.0 * pad_x;
+            }
+            cy += heights[r] + line;
+        }
+        let outline = Kind::Outline { x: self.x, w: table_w, radius, line, color: self.theme.border };
+        self.push(y, table_h, outline);
+    }
+}
+
+/// Column widths for a table whose columns would like `natural` widths but
+/// only have `room` in total. Columns narrower than an equal share keep
+/// their width, so a short column is never squeezed because of a long one;
+/// the others share what is left in proportion to their content.
+fn fit_columns(natural: &[f32], room: f32, min: f32) -> Vec<f32> {
+    let mut widths = natural.to_vec();
+    let mut flexible: Vec<usize> = (0..natural.len()).collect();
+    let mut room = room;
+    loop {
+        let wanted: f32 = flexible.iter().map(|&c| natural[c]).sum();
+        if wanted <= room || flexible.is_empty() {
+            return widths;
+        }
+        let share = room / flexible.len() as f32;
+        let (fits, wide): (Vec<usize>, Vec<usize>) = flexible.iter().partition(|&&c| natural[c] <= share);
+        if fits.is_empty() {
+            for c in wide {
+                widths[c] = (natural[c] * room / wanted).floor().max(min);
+            }
+            return widths;
+        }
+        room -= fits.iter().map(|&c| natural[c]).sum::<f32>();
+        flexible = wide;
+    }
+}
+
+fn load_image<'a>(
+    images: &'a mut HashMap<PathBuf, Option<RgbaImage>>,
+    base_dir: &Path,
+    dest: &str,
+) -> Option<&'a RgbaImage> {
+    if dest.contains("://") && !dest.starts_with("file://") {
+        return None;
+    }
+    let path = base_dir.join(dest.strip_prefix("file://").unwrap_or(dest));
+    images
+        .entry(path)
+        .or_insert_with_key(|p| image::open(p).ok().map(|i| i.to_rgba8()))
+        .as_ref()
+}
+
+// ---------------------------------------------------------------------------
+// Rasterization
+// ---------------------------------------------------------------------------
+
+/// A strip of the page being drawn: premultiplied RGBA, `w` × `h` pixels.
+struct Canvas<'a> {
+    data: &'a mut [u8],
+    w: i32,
+    h: i32,
+}
+
+/// `x / 255`, rounded, for `x` up to 255 * 255.
+#[inline]
+fn div255(x: u32) -> u32 {
+    let x = x + 128;
+    (x + (x >> 8)) >> 8
+}
+
+impl Canvas<'_> {
+    /// Source-over `c` at `coverage` (0..=255) onto one pixel.
+    #[inline]
+    fn blend(px: &mut [u8], c: Rgba, coverage: u32) {
+        let a = div255(c.3 as u32 * coverage);
+        if a == 0 {
+            return;
+        }
+        let inv = 255 - a;
+        px[0] = div255(c.0 as u32 * a + px[0] as u32 * inv) as u8;
+        px[1] = div255(c.1 as u32 * a + px[1] as u32 * inv) as u8;
+        px[2] = div255(c.2 as u32 * a + px[2] as u32 * inv) as u8;
+        px[3] = (a + div255(px[3] as u32 * inv)) as u8;
+    }
+
+    /// Clip the box at (`x`, `y`) of size `w` × `h` to the canvas. Returns
+    /// the visible part as (x0, y0, x1, y1), or `None` if there is none.
+    fn clip(&self, x: i32, y: i32, w: i32, h: i32) -> Option<(i32, i32, i32, i32)> {
+        let (x0, y0, x1, y1) = (x.max(0), y.max(0), (x + w).min(self.w), (y + h).min(self.h));
+        (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+    }
+
+    fn row(&mut self, y: i32, x0: i32, x1: i32) -> &mut [u8] {
+        let start = (y * self.w + x0) as usize * 4;
+        &mut self.data[start..start + (x1 - x0) as usize * 4]
+    }
+
+    fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, c: Rgba) {
+        let Some((x0, y0, x1, y1)) = self.clip(x, y, w, h) else { return };
+        for py in y0..y1 {
+            for px in self.row(py, x0, x1).chunks_exact_mut(4) {
+                Self::blend(px, c, 255);
+            }
+        }
+    }
+
+    /// Draw a rasterized glyph with its top-left at (`x`, `y`).
+    fn glyph(&mut self, x: i32, y: i32, img: &SwashImage, c: Rgba) {
+        let (gw, gh) = (img.placement.width as i32, img.placement.height as i32);
+        let Some((x0, y0, x1, y1)) = self.clip(x, y, gw, gh) else { return };
+        for py in y0..y1 {
+            let src = ((py - y) * gw + (x0 - x)) as usize;
+            let dst = self.row(py, x0, x1).chunks_exact_mut(4);
+            match img.content {
+                SwashContent::Mask => {
+                    for (px, &cov) in dst.zip(&img.data[src..]) {
+                        if cov != 0 {
+                            Self::blend(px, c, cov as u32);
+                        }
+                    }
+                }
+                // Color glyphs (emoji) carry their own straight-alpha color.
+                SwashContent::Color => {
+                    for (px, s) in dst.zip(img.data[src * 4..].chunks_exact(4)) {
+                        Self::blend(px, Rgba(s[0], s[1], s[2], s[3]), c.3 as u32);
+                    }
+                }
+                SwashContent::SubpixelMask => {}
+            }
+        }
+    }
+
+    fn image(&mut self, x: i32, y: i32, img: &RgbaImage) {
+        let (iw, ih) = (img.width() as i32, img.height() as i32);
+        let Some((x0, y0, x1, y1)) = self.clip(x, y, iw, ih) else { return };
+        let pixels = img.as_raw();
+        for py in y0..y1 {
+            let src = ((py - y) * iw + (x0 - x)) as usize * 4;
+            for (px, s) in self.row(py, x0, x1).chunks_exact_mut(4).zip(pixels[src..].chunks_exact(4)) {
+                Self::blend(px, Rgba(s[0], s[1], s[2], s[3]), 255);
+            }
         }
     }
 }
 
 impl Doc {
     /// Rasterize the strip `[y0, y0 + height)` of the page as straight RGBA.
-    pub fn render(&mut self, engine: &mut Engine, y0: u32, height: u32) -> Vec<u8> {
+    pub fn render(&self, eng: &mut Engine, y0: u32, height: u32) -> Vec<u8> {
         let (w, h) = (self.width.max(1), height.max(1));
         let mut pm = Pixmap::new(w, h).expect("non-zero pixmap size");
-        pm.fill(tiny_skia::Color::from_rgba8(self.bg.0, self.bg.1, self.bg.2, 255));
+        let theme = &self.lay.theme;
+        if let Some(bg) = theme.page {
+            pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
+        }
 
         let (top, bottom) = (y0 as f32, (y0 + height) as f32);
+        // How far outside its line box a glyph may paint.
+        let slack = self.lay.em;
         let shift = Transform::from_translate(0.0, -top);
-        for item in &mut self.items {
-            if item.y - self.slack >= bottom || item.y + item.h + self.slack <= top {
+        for item in &self.lay.items {
+            if item.y - slack >= bottom || item.y + item.h + slack <= top {
                 continue;
             }
-            match &mut item.kind {
-                Kind::Rect { x, w, radius, color } => {
-                    fill_rrect(&mut pm, *x, item.y, *w, item.h, *radius, *color, shift);
-                }
-                Kind::Text { x, buf, color: c } => {
-                    let (ox, oy) = (x.round() as i32, (item.y - top).round() as i32);
-                    let (pw, ph) = (w as i32, h as i32);
-                    let data = pm.data_mut();
-                    buf.draw(&mut engine.fs, &mut engine.swash, color(*c), |gx, gy, gw, gh, col| {
-                        let a = col.a() as u32;
-                        if a == 0 {
-                            return;
-                        }
-                        for py in (oy + gy).max(0)..(oy + gy + gh as i32).min(ph) {
-                            for px in (ox + gx).max(0)..(ox + gx + gw as i32).min(pw) {
-                                let i = (py * pw + px) as usize * 4;
-                                blend(&mut data[i..i + 3], [col.r(), col.g(), col.b()], a);
-                            }
-                        }
-                    });
-                }
-                Kind::Image { x, img } => {
-                    let (ox, oy) = (x.round() as i64, (item.y - top).round() as i64);
-                    let data = pm.data_mut();
-                    for (ix, iy, p) in img.enumerate_pixels() {
-                        let (px, py) = (ox + ix as i64, oy + iy as i64);
-                        if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 || p[3] == 0 {
-                            continue;
-                        }
-                        let i = (py as usize * w as usize + px as usize) * 4;
-                        blend(&mut data[i..i + 3], [p[0], p[1], p[2]], p[3] as u32);
+            match &item.kind {
+                Kind::Rect { x, w, radii, color } => fill_rrect(&mut pm, *x, item.y, *w, item.h, *radii, *color, shift),
+                Kind::Outline { x, w, radius, line, color } => {
+                    // Stroke centered half a line inside the box, so the
+                    // outline is exactly `line` thick and stays in bounds.
+                    let half = line / 2.0;
+                    let radii = [(radius - half).max(0.0); 4];
+                    if let Some(path) = rrect(x + half, item.y + half, w - line, item.h - line, radii) {
+                        let stroke = Stroke { width: *line, ..Stroke::default() };
+                        pm.stroke_path(&path, &paint(*color), &stroke, shift, None);
                     }
                 }
-                Kind::Check { x, checked, border } => {
-                    let (x, y, s) = (x.round(), item.y, item.h);
-                    let r = s * 0.2;
-                    if *checked {
-                        fill_rrect(&mut pm, x, y, s, s, r, self.link, shift);
-                        let mut pb = PathBuilder::new();
-                        pb.move_to(x + s * 0.24, y + s * 0.52);
-                        pb.line_to(x + s * 0.43, y + s * 0.70);
-                        pb.line_to(x + s * 0.76, y + s * 0.32);
-                        if let Some(path) = pb.finish() {
-                            let stroke = Stroke { width: (s * 0.13).max(1.5), ..Stroke::default() };
-                            pm.stroke_path(&path, &paint(Rgb(255, 255, 255)), &stroke, shift, None);
+                Kind::Check { x } => {
+                    let (x, y, s) = (*x, item.y, item.h);
+                    let mut pb = PathBuilder::new();
+                    pb.move_to(x + s * 0.25, y + s * 0.52);
+                    pb.line_to(x + s * 0.43, y + s * 0.69);
+                    pb.line_to(x + s * 0.75, y + s * 0.33);
+                    if let Some(path) = pb.finish() {
+                        let stroke = Stroke {
+                            width: (s * 0.12).max(1.5),
+                            line_cap: tiny_skia::LineCap::Round,
+                            line_join: tiny_skia::LineJoin::Round,
+                            ..Stroke::default()
+                        };
+                        pm.stroke_path(&path, &paint(Rgba(255, 255, 255, 255)), &stroke, shift, None);
+                    }
+                }
+                Kind::Image { x, img } => {
+                    let mut canvas = Canvas { data: pm.data_mut(), w: w as i32, h: h as i32 };
+                    canvas.image(x.round() as i32, (item.y - top).round() as i32, img);
+                }
+                Kind::Text { x, buf, color: default } => {
+                    let mut canvas = Canvas { data: pm.data_mut(), w: w as i32, h: h as i32 };
+                    let (ox, oy) = (x.round() as i32, (item.y - top).round() as i32);
+                    for run in buf.layout_runs() {
+                        // Skip lines outside the strip: a long code block
+                        // spans many tiles but each needs only a few lines.
+                        let line_top = item.y + run.line_top;
+                        if line_top - slack >= bottom || line_top + run.line_height + slack <= top {
+                            continue;
                         }
-                    } else {
-                        let t = (s * 0.09).max(1.0).round();
-                        fill_rrect(&mut pm, x, y, s, s, r, *border, shift);
-                        fill_rrect(&mut pm, x + t, y + t, s - 2.0 * t, s - 2.0 * t, r - t, self.bg, shift);
+                        for g in run.glyphs {
+                            let pg = g.physical((0.0, run.line_y), 1.0);
+                            let c = g.color_opt.map_or(*default, |c| Rgba(c.r(), c.g(), c.b(), c.a()));
+                            if let Some(img) = eng.swash.get_image(&mut eng.fs, pg.cache_key) {
+                                let (gx, gy) = (ox + pg.x + img.placement.left, oy + pg.y - img.placement.top);
+                                canvas.glyph(gx, gy, img, c);
+                            }
+                        }
+                        // Strike through runs of glyphs marked for it.
+                        let mut glyphs = run.glyphs.iter().peekable();
+                        while let Some(g) = glyphs.next() {
+                            if g.metadata & META_STRIKE == 0 {
+                                continue;
+                            }
+                            let (x0, mut x1) = (g.x, g.x + g.w);
+                            while let Some(next) = glyphs.next_if(|n| n.metadata & META_STRIKE != 0) {
+                                x1 = next.x + next.w;
+                            }
+                            let c = g.color_opt.map_or(*default, |c| Rgba(c.r(), c.g(), c.b(), c.a()));
+                            let thick = (g.font_size * 0.07).round().max(1.0);
+                            let y = (run.line_y - g.font_size * 0.3).round();
+                            let (x, w) = (ox + x0.round() as i32, (x1 - x0).round() as i32);
+                            canvas.fill(x, oy + y as i32, w, thick as i32, c);
+                        }
                     }
                 }
             }
         }
-        // The background is opaque, so premultiplied == straight alpha.
-        pm.take()
+
+        let mut data = pm.take();
+        if theme.page.is_none() {
+            unpremultiply(&mut data);
+        }
+        data
+    }
+
+    /// Render the whole document onto an opaque page `page_w` pixels wide,
+    /// for PNG export.
+    pub fn render_page(&mut self, eng: &mut Engine, page_w: u32, bg: Rgb) -> RgbaImage {
+        self.advance(eng, None, None);
+        self.highlight(eng, None);
+        let (w, h) = (self.width, self.height.max(1));
+        let strip = self.render(eng, 0, h);
+        let page_w = page_w.max(w);
+        let mut page = RgbaImage::from_pixel(page_w, h, image::Rgba([bg.0, bg.1, bg.2, 255]));
+        let x0 = ((page_w - w) / 2) as usize;
+        for (y, row) in strip.chunks_exact(w as usize * 4).enumerate() {
+            let start = (y * page_w as usize + x0) * 4;
+            page.as_mut()[start..start + row.len()].copy_from_slice(row);
+        }
+        page
     }
 }
 
-fn blend(dst: &mut [u8], src: [u8; 3], alpha: u32) {
-    for (d, s) in dst.iter_mut().zip(src) {
-        *d = ((s as u32 * alpha + *d as u32 * (255 - alpha) + 127) / 255) as u8;
+/// Premultiplied → straight alpha, which is what the Kitty protocol takes.
+fn unpremultiply(data: &mut [u8]) {
+    // Only translucent pixels change, and those are just glyph and shape
+    // edges; whole blocks of transparent or opaque pixels are skipped with a
+    // check the compiler can vectorize.
+    for block in data.chunks_mut(64 * 4) {
+        let translucent = |px: &[u8]| px[3].wrapping_sub(1) < 254;
+        if !block.chunks_exact(4).fold(false, |any, px| any | translucent(px)) {
+            continue;
+        }
+        for px in block.chunks_exact_mut(4).filter(|px| translucent(px)) {
+            let a = px[3] as u32;
+            for c in &mut px[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
     }
 }
 
-fn paint(c: Rgb) -> Paint<'static> {
+fn paint(c: Rgba) -> Paint<'static> {
     let mut p = Paint::default();
-    p.set_color_rgba8(c.0, c.1, c.2, 255);
+    p.set_color_rgba8(c.0, c.1, c.2, c.3);
     p.anti_alias = true;
     p
 }
 
+/// Rounded rectangle path; `radii` are clockwise from top-left.
+fn rrect(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) -> Option<tiny_skia::Path> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let [tl, tr, br, bl] = radii.map(|r| r.min(w / 2.0).min(h / 2.0).max(0.0));
+    const K: f32 = 0.5523; // cubic approximation of a quarter circle
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + tl, y);
+    pb.line_to(x + w - tr, y);
+    pb.cubic_to(x + w - tr + tr * K, y, x + w, y + tr - tr * K, x + w, y + tr);
+    pb.line_to(x + w, y + h - br);
+    pb.cubic_to(x + w, y + h - br + br * K, x + w - br + br * K, y + h, x + w - br, y + h);
+    pb.line_to(x + bl, y + h);
+    pb.cubic_to(x + bl - bl * K, y + h, x, y + h - bl + bl * K, x, y + h - bl);
+    pb.line_to(x, y + tl);
+    pb.cubic_to(x, y + tl - tl * K, x + tl - tl * K, y, x + tl, y);
+    pb.close();
+    pb.finish()
+}
+
 #[allow(clippy::too_many_arguments)]
-fn fill_rrect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgb, ts: Transform) {
+fn fill_rrect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, radii: [f32; 4], c: Rgba, ts: Transform) {
     if w <= 0.0 || h <= 0.0 {
         return;
     }
-    let r = r.min(w / 2.0).min(h / 2.0);
-    if r <= 0.0 {
+    if radii.iter().all(|&r| r <= 0.0) {
         // Snap square corners to the pixel grid so edges stay crisp.
         let (x0, y0) = (x.round(), y.round());
         if let Some(rect) = tiny_skia::Rect::from_xywh(x0, y0, w.round().max(1.0), h.round().max(1.0)) {
             pm.fill_rect(rect, &paint(c), ts, None);
         }
-        return;
-    }
-    let k = r * 0.5523; // cubic approximation of a quarter circle
-    let mut pb = PathBuilder::new();
-    pb.move_to(x + r, y);
-    pb.line_to(x + w - r, y);
-    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
-    pb.line_to(x + w, y + h - r);
-    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
-    pb.line_to(x + r, y + h);
-    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
-    pb.line_to(x, y + r);
-    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
-    pb.close();
-    if let Some(path) = pb.finish() {
+    } else if let Some(path) = rrect(x, y, w, h, radii) {
         pm.fill_path(&path, &paint(c), FillRule::Winding, ts, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_scripts() {
+        assert_eq!(script_runs("用 Nix 构建"), vec![("用 ", true), ("Nix ", false), ("构建", true)]);
+        assert_eq!(script_runs("plain text"), vec![("plain text", false)]);
+        assert_eq!(script_runs("  中文"), vec![("  中文", true)]);
+        assert_eq!(script_runs(""), vec![]);
+    }
+
+    #[test]
+    fn short_columns_keep_their_width() {
+        // Everything fits: untouched.
+        assert_eq!(fit_columns(&[40.0, 60.0], 200.0, 10.0), vec![40.0, 60.0]);
+        // One long column: only it shrinks.
+        assert_eq!(fit_columns(&[40.0, 50.0, 900.0], 400.0, 10.0), vec![40.0, 50.0, 310.0]);
+        // Two long columns share the rest in proportion.
+        assert_eq!(fit_columns(&[40.0, 600.0, 300.0], 400.0, 10.0), vec![40.0, 240.0, 120.0]);
+        // Nothing fits an equal share: all shrink in proportion, down to the minimum.
+        assert_eq!(fit_columns(&[300.0, 100.0], 40.0, 16.0), vec![30.0, 16.0]);
+    }
+
+    #[test]
+    fn unpremultiplies() {
+        let mut px = [50, 25, 0, 100, 9, 9, 9, 255, 0, 0, 0, 0];
+        unpremultiply(&mut px);
+        assert_eq!(px, [128, 64, 0, 100, 9, 9, 9, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn blends_over_transparent() {
+        let mut px = [0u8; 4];
+        Canvas::blend(&mut px, Rgba(200, 100, 0, 255), 128);
+        assert_eq!(px, [100, 50, 0, 128]);
+        // Opaque coverage replaces the pixel.
+        Canvas::blend(&mut px, Rgba(10, 20, 30, 255), 255);
+        assert_eq!(px, [10, 20, 30, 255]);
     }
 }
