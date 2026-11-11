@@ -2,6 +2,7 @@
 //! using the Kitty graphics protocol.
 
 mod doc;
+mod font_cache;
 mod fonts;
 mod highlight;
 mod kitty;
@@ -107,8 +108,9 @@ impl Trace {
 fn main() -> Result<()> {
     let mut trace = Trace { start: Instant::now(), notes: Vec::new() };
     let cli = Cli::parse();
-    // Indexing the installed fonts is the slowest part of starting up, so it
-    // runs while the file is read and the terminal is probed.
+    // Indexing the installed fonts is the slowest part of starting up when
+    // it is not cached, so it runs while the file is read and the terminal
+    // is probed.
     let scan = std::thread::spawn(fonts::scan);
     let source = read_source(&cli.file)?;
     // Likewise syntax highlighting, which has its own thread.
@@ -117,7 +119,8 @@ fn main() -> Result<()> {
     let engine = |trace: &mut Trace| -> Result<Engine> {
         let installed = scan.join().map_err(|_| anyhow!("scanning the installed fonts failed"))?;
         let took = installed.took.as_secs_f64() * 1e3;
-        trace.note(format!("font scan joined: {} faces, took {took:.1}ms", installed.faces()));
+        let how = if installed.cached { "read from cache" } else { "scanned" };
+        trace.note(format!("font index joined: {} faces, {how} in {took:.1}ms", installed.faces()));
         let engine = Engine::new(installed, highlighter, cli.font.as_deref(), cli.mono_font.as_deref());
         trace.note(format!("fonts ready: {}", engine.font_names()));
         Ok(engine)

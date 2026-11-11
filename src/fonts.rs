@@ -11,8 +11,9 @@
 //! chosen Latin, monospace and CJK families. Each text run is then assigned a
 //! family and a weight that family really has (see `Family::weight`). Other
 //! families are copied in only when the document contains characters the
-//! chosen ones cannot draw.
+//! chosen ones cannot draw. The scan result is cached on disk (`font_cache`).
 
+use crate::font_cache::{self, Index};
 use cosmic_text::fontdb::{Database, FaceInfo, Style};
 use cosmic_text::skrifa::{FontRef, MetadataProvider, Tag};
 use cosmic_text::{FontSystem, PlatformFallback};
@@ -154,29 +155,34 @@ pub struct Fonts {
 
 /// What `scan` found on this machine.
 pub struct Installed {
-    db: Database,
-    /// The system's configured default families (sans, monospace, CJK),
-    /// where there is a way to ask.
-    defaults: [Option<String>; 3],
-    /// How long the scan took, for `TERMD_DEBUG`.
+    index: Index,
+    /// How long it took and whether it came from the cache, for `TERMD_DEBUG`.
     pub took: std::time::Duration,
+    pub cached: bool,
 }
 
 impl Installed {
     pub fn faces(&self) -> usize {
-        self.db.len()
+        self.index.db.len()
     }
 }
 
-/// Index the installed fonts. Slow (tens of milliseconds, more on machines
-/// with many fonts), so `main` runs it on a thread while the terminal is
-/// being probed.
+/// Index the installed fonts, from the cache if nothing has changed since
+/// it was written. A real scan is slow (hundreds of milliseconds with many
+/// fonts, seconds after a reboot), so `main` runs this on a thread while the
+/// terminal is being probed.
 pub fn scan() -> Installed {
     let start = std::time::Instant::now();
+    let lang = cjk_lang().1;
+    if let Some(index) = font_cache::load(lang) {
+        return Installed { index, took: start.elapsed(), cached: true };
+    }
+
     // On Linux and the BSDs fontconfig knows which fonts the user prefers.
     // The three questions run as concurrent processes while we scan.
-    let cjk_pattern = format!("sans-serif:lang={}", cjk_lang().1);
-    let asked = ["sans-serif", "monospace", &cjk_pattern].map(|pattern| {
+    let cjk_pattern = format!("sans-serif:lang={lang}");
+    // The first two are asked for English text: they are used for non-CJK runs.
+    let asked = ["sans-serif:lang=en", "monospace:lang=en", &cjk_pattern].map(|pattern| {
         if cfg!(target_os = "macos") {
             return None;
         }
@@ -206,7 +212,9 @@ pub fn scan() -> Installed {
         let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
         (out.status.success() && !name.is_empty()).then_some(name)
     });
-    Installed { db, defaults, took: start.elapsed() }
+    let index = Index { db, defaults };
+    font_cache::store(&index, lang);
+    Installed { index, took: start.elapsed(), cached: false }
 }
 
 fn has_name(face: &FaceInfo, name: &str) -> bool {
@@ -252,7 +260,7 @@ impl Fonts {
     /// Choose the families and build a `FontSystem` that knows only them.
     /// `sans` / `mono` are the user's explicit choices.
     pub fn new(installed: Installed, sans: Option<&str>, mono: Option<&str>) -> (FontSystem, Fonts) {
-        let Installed { db: all, defaults: [fc_sans, fc_mono, fc_cjk], .. } = installed;
+        let Index { db: all, defaults: [fc_sans, fc_mono, fc_cjk] } = installed.index;
         // Explicit choice, then the system's configured default, then the
         // first installed family of our own list.
         let pick = |explicit: Option<&str>, configured: &Option<String>, list: &[&str]| {
