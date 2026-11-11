@@ -6,6 +6,7 @@ mod font_cache;
 mod fonts;
 mod highlight;
 mod kitty;
+mod source;
 mod term;
 mod theme;
 
@@ -679,6 +680,11 @@ impl Viewer {
             (true, max) => format!("{}%", (self.target.round() as u64 * 100 / max as u64).min(100)),
         };
         let name = self.path.file_name().unwrap_or(self.path.as_os_str()).to_string_lossy();
+        // The source line at the top of the viewport, as an editor would name it.
+        let name = match self.doc.source_line(self.target as u32) {
+            Some(line) => format!("{name}:{line}"),
+            None => name.to_string(),
+        };
         let hints = "j/k scroll · space/b page · g/G top/end · +/- zoom · q quit";
         let left = format!(" {name}   {hints}");
         let room = cols.saturating_sub(position.chars().count() + 3);

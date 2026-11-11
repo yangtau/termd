@@ -13,6 +13,7 @@
 
 use crate::fonts::{Choice, Face, Fonts, Installed};
 use crate::highlight::{Highlighter, Token};
+use crate::source::{Lines, TextMap};
 use crate::theme::{Rgb, Rgba, Theme};
 use cosmic_text::{
     Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent,
@@ -21,6 +22,7 @@ use cosmic_text::{
 use image::RgbaImage;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
@@ -28,9 +30,11 @@ use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 /// Glyph metadata flags: inline code (gets a background), struck-through
 /// text and links (underlined). cosmic-text has its own decorations, but it
 /// loses them on runs that use a different font than the paragraph's first.
+/// The bits above `META_LINK_SHIFT` hold the link's number plus one.
 const META_CODE: usize = 1;
 const META_STRIKE: usize = 2;
 const META_LINK: usize = 4;
+const META_LINK_SHIFT: u32 = 8;
 
 const HEADING_SCALE: [f32; 6] = [1.75, 1.35, 1.15, 1.0, 0.9, 0.85];
 const BODY_LINE: f32 = 1.65;
@@ -74,31 +78,66 @@ pub struct Doc {
     pub origin_x: u32,
     /// Height laid out so far; final once `done()`.
     height: u32,
-    events: std::vec::IntoIter<Event<'static>>,
+    events: std::vec::IntoIter<(Event<'static>, Range<usize>)>,
+    lines: Lines,
     lay: Layout,
     done: bool,
 }
 
-/// A reading position that survives a re-layout at another size.
+/// A reading position that survives a re-layout: a line of text, known by
+/// where it comes from in the source.
 #[derive(Clone, Copy)]
 pub struct Anchor {
-    /// Parser event that produced the block.
+    /// Source offset of the first character of the line.
     src: u32,
-    /// Which of that event's blocks (a table produces one per cell).
-    nth: u32,
-    /// Position inside the block, as a fraction of its height.
+    /// Position inside the line, as a fraction of its height.
     frac: f32,
+}
+
+/// What is at a point of the page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hit {
+    /// The text item nearest to the point.
+    pub item: u32,
+    /// Offset in the item's text of the character boundary nearest to it.
+    pub offset: u32,
+    /// Whether the point is on one of the item's characters, rather than
+    /// beside or between its lines.
+    pub inside: bool,
+    /// The link the character under the point belongs to.
+    pub link: Option<u32>,
 }
 
 struct Item {
     y: f32,
     h: f32,
-    src: u32,
+    /// The part of the source this was made from.
+    src: Range<u32>,
     kind: Kind,
 }
 
+/// What makes a text item part of the document's content (as opposed to
+/// decoration such as list numbers and labels).
+struct Content {
+    map: TextMap,
+    /// Offset in the text at which each line of the buffer starts.
+    line_starts: Vec<u32>,
+    /// What separates this text from the one before it when both are copied.
+    join: Join,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Join {
+    /// A new block: an empty line in between.
+    Block,
+    /// The next line (list items, table rows).
+    Line,
+    /// The next cell of a table row.
+    Cell,
+}
+
 enum Kind {
-    Text { x: f32, buf: Buffer, color: Rgba },
+    Text { x: f32, buf: Buffer, color: Rgba, content: Option<Box<Content>> },
     /// Filled rectangle; `radii` are the corner radii clockwise from top-left.
     Rect { x: f32, w: f32, radii: [f32; 4], color: Rgba },
     /// Rounded rectangle outline drawn inside the box.
@@ -114,8 +153,11 @@ struct Span {
     italic: bool,
     strike: bool,
     code: bool,
-    link: bool,
+    /// Number of the link this is part of.
+    link: Option<u32>,
     color: Option<Rgba>,
+    /// Where the text is in the source.
+    src: Range<u32>,
 }
 
 struct TextStyle {
@@ -216,7 +258,8 @@ fn make_buffer(eng: &mut Engine, spans: &[Span], st: &TextStyle, width: Option<f
                 a = a.style(Style::Italic);
             }
             let flag = |on: bool, flag: usize| if on { flag } else { 0 };
-            a = a.metadata(flag(s.code, META_CODE) | flag(s.strike, META_STRIKE) | flag(s.link, META_LINK));
+            let link = s.link.map_or(0, |id| (id as usize + 1) << META_LINK_SHIFT | META_LINK);
+            a = a.metadata(flag(s.code, META_CODE) | flag(s.strike, META_STRIKE) | link);
             if s.code {
                 a = a.metrics(Metrics::new(st.size * CODE_SCALE, st.line_h));
             }
@@ -229,6 +272,27 @@ fn make_buffer(eng: &mut Engine, spans: &[Span], st: &TextStyle, width: Option<f
     buf.set_rich_text(rich, &base, Shaping::Advanced, None);
     buf.shape_until_scroll(&mut eng.fs, false);
     buf
+}
+
+/// What a content text item needs to know about its text: `map` says where
+/// it comes from.
+fn content(buf: &Buffer, map: TextMap, join: Join) -> Option<Box<Content>> {
+    let mut at = 0;
+    let line_starts = buf
+        .lines
+        .iter()
+        .map(|line| {
+            let start = at;
+            at += (line.text().len() + line.ending().as_str().len()) as u32;
+            start
+        })
+        .collect();
+    Some(Box::new(Content { map, line_starts, join }))
+}
+
+/// The map of text shaped from `spans`.
+fn span_map(spans: &[Span]) -> TextMap {
+    TextMap::from_pieces(spans.iter().map(|s| (s.text.len(), s.src.clone())))
 }
 
 /// (widest line, total height) of a shaped buffer.
@@ -308,9 +372,15 @@ struct Layout {
     first: bool,
     /// Everything above this is final: no later item will be drawn there.
     stable: f32,
-    /// Number of parser events consumed.
-    src: u32,
+    /// The Markdown being laid out.
+    source: String,
+    /// Source range of the parser event being handled.
+    at: Range<u32>,
+    /// How far into the source the text items placed so far reach.
+    covered: u32,
     items: Vec<Item>,
+    /// Destinations of the links seen so far; text refers to them by index.
+    links: Vec<String>,
     /// Code blocks waiting for their colors, in document order.
     uncolored: VecDeque<Uncolored>,
 
@@ -318,7 +388,8 @@ struct Layout {
     bold: u32,
     italic: u32,
     strike: u32,
-    link: u32,
+    /// Number of the open link.
+    link: Option<u32>,
     heading: Option<usize>,
     /// Next ordinal for each open list (`None` = bullet list).
     lists: Vec<Option<u64>>,
@@ -329,8 +400,9 @@ struct Layout {
     lead: Option<f32>,
     /// Open block quotes: bar x and the y where their content started.
     quotes: Vec<(f32, Option<f32>)>,
-    /// Open code block: (language, text).
+    /// Open code block: (language, text), and where its text is in the source.
     code: Option<(String, String)>,
+    code_src: Range<u32>,
     html: Option<String>,
     /// Open image: (destination, alt text).
     image: Option<(String, String)>,
@@ -341,12 +413,16 @@ struct Layout {
     soft_break: bool,
 }
 
-fn parse(markdown: &str) -> Vec<Event<'static>> {
+/// The parser events of `markdown`, each with its range in the source.
+fn parse(markdown: &str) -> Vec<(Event<'static>, Range<usize>)> {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    Parser::new_ext(markdown, options).map(Event::into_static).collect()
+    Parser::new_ext(markdown, options)
+        .into_offset_iter()
+        .map(|(event, range)| (event.into_static(), range))
+        .collect()
 }
 
 /// Language of a fenced code block's info string.
@@ -365,10 +441,10 @@ fn code_text(raw: &str) -> &str {
 }
 
 /// The (language, code) of every fenced code block, in document order.
-fn code_blocks(events: &[Event]) -> Vec<(String, String)> {
+fn code_blocks(events: &[(Event, Range<usize>)]) -> Vec<(String, String)> {
     let mut blocks = Vec::new();
     let mut open: Option<(String, String)> = None;
-    for event in events {
+    for (event, _) in events {
         match event {
             Event::Start(Tag::CodeBlock(kind)) => open = Some((code_lang(kind), String::new())),
             Event::Text(t) => {
@@ -417,6 +493,7 @@ impl Doc {
             origin_x: origin_x as u32,
             height: 0,
             events: events.into_iter(),
+            lines: Lines::new(markdown),
             done: false,
             lay: Layout {
                 theme: opts.theme,
@@ -428,20 +505,24 @@ impl Doc {
                 margin: 0.0,
                 first: true,
                 stable: 0.0,
-                src: 0,
+                source: markdown.to_string(),
+                at: 0..0,
+                covered: 0,
                 items: Vec::new(),
+                links: Vec::new(),
                 uncolored: VecDeque::new(),
                 spans: Vec::new(),
                 bold: 0,
                 italic: 0,
                 strike: 0,
-                link: 0,
+                link: None,
                 heading: None,
                 lists: Vec::new(),
                 marker: None,
                 lead: None,
                 quotes: Vec::new(),
                 code: None,
+                code_src: 0..0,
                 html: None,
                 image: None,
                 table: None,
@@ -459,9 +540,9 @@ impl Doc {
                 return;
             }
             match self.events.next() {
-                Some(event) => {
+                Some((event, range)) => {
+                    self.lay.at = range.start as u32..range.end as u32;
                     self.lay.event(eng, event);
-                    self.lay.src += 1;
                     self.height = self.lay.stable.floor() as u32;
                 }
                 None => {
@@ -524,32 +605,139 @@ impl Doc {
         self.done
     }
 
-    fn blocks(&self) -> impl Iterator<Item = &Item> {
-        self.lay.items.iter().filter(|i| matches!(i.kind, Kind::Text { .. } | Kind::Image { .. }))
+    /// The text items that are document content, with their index.
+    fn texts(&self) -> impl Iterator<Item = (usize, &Item, f32, &Buffer, &Content)> {
+        self.lay.items.iter().enumerate().filter_map(|(i, item)| match &item.kind {
+            Kind::Text { x, buf, content: Some(content), .. } => Some((i, item, *x, buf, &**content)),
+            _ => None,
+        })
     }
 
-    /// The block at page offset `y`, to restore the position after a re-layout.
+    /// The topmost line of text that ends below page offset `y`: its top,
+    /// its height and the source offset of its first character.
+    fn line_below(&self, y: f32) -> Option<(f32, f32, u32)> {
+        let mut best: Option<(f32, f32, u32)> = None;
+        for (_, item, _, buf, content) in self.texts() {
+            if item.y + item.h <= y || best.is_some_and(|(top, ..)| item.y >= top) {
+                continue;
+            }
+            for run in buf.layout_runs() {
+                let top = item.y + run.line_top;
+                if top + run.line_height > y {
+                    if best.is_none_or(|(best_top, ..)| top < best_top) {
+                        let first = run.glyphs.iter().map(|g| g.start).min().unwrap_or(0) as u32;
+                        let offset = content.line_starts.get(run.line_i).copied().unwrap_or(0) + first;
+                        best = Some((top, run.line_height, content.map.to_source(offset)));
+                    }
+                    break;
+                }
+            }
+        }
+        best
+    }
+
+    /// 1-based source line of the first text at or below page offset `y`.
+    pub fn source_line(&self, y: u32) -> Option<u32> {
+        self.line_below(y as f32).map(|(_, _, src)| self.lines.line_of(src))
+    }
+
+    /// The line of text at page offset `y`, to find the position again
+    /// after a re-layout.
     pub fn anchor(&self, y: u32) -> Option<Anchor> {
-        let y = y as f32;
-        let item = self
-            .blocks()
-            .filter(|i| i.y + i.h > y)
-            .min_by(|a, b| a.y.total_cmp(&b.y))?;
-        let nth = self
-            .blocks()
-            .filter(|i| i.src == item.src)
-            .position(|i| std::ptr::eq(i, item))?;
-        Some(Anchor { src: item.src, nth: nth as u32, frac: (y - item.y) / item.h.max(1.0) })
+        let (top, height, src) = self.line_below(y as f32)?;
+        // Above the line (in a margin): keep the distance, within reason.
+        Some(Anchor { src, frac: ((y as f32 - top) / height.max(1.0)).clamp(-4.0, 1.0) })
     }
 
     /// Page offset of `anchor` in this layout, laying out as far as needed.
     pub fn resolve(&mut self, eng: &mut Engine, anchor: Anchor) -> u32 {
-        while !self.done && self.lay.src <= anchor.src {
+        while !self.done && self.lay.covered <= anchor.src {
             let more = self.height + 1;
             self.advance(eng, Some(more), None);
         }
-        let found = self.blocks().filter(|i| i.src == anchor.src).nth(anchor.nth as usize);
-        found.map_or(0, |i| (i.y + anchor.frac * i.h).max(0.0) as u32)
+        // The text the offset is in, or else the first text after it.
+        let found = self
+            .texts()
+            .filter(|(_, _, _, _, content)| content.map.range().end > anchor.src)
+            .min_by_key(|(_, _, _, _, content)| content.map.range().start);
+        let Some((_, item, _, buf, content)) = found else { return self.height };
+        let offset = content.map.from_source(anchor.src.max(content.map.range().start));
+        let line = content.line_starts.partition_point(|&start| start <= offset).saturating_sub(1);
+        let in_line = offset - content.line_starts[line];
+        let run = buf
+            .layout_runs()
+            .filter(|run| run.line_i == line)
+            .find(|run| run.glyphs.iter().any(|g| g.end as u32 > in_line))
+            .or_else(|| buf.layout_runs().filter(|run| run.line_i <= line).last());
+        let (top, height) = run.map_or((0.0, 0.0), |run| (run.line_top, run.line_height));
+        (item.y + top + anchor.frac * height).max(0.0) as u32
+    }
+
+    /// Page offset of the text that comes from 1-based source `line` (or the
+    /// first text after it).
+    pub fn offset_of_line(&mut self, eng: &mut Engine, line: u32) -> u32 {
+        let src = self.lines.start_of(line);
+        self.resolve(eng, Anchor { src, frac: 0.0 })
+    }
+
+    /// What is at the point (`x`, `y`) of the page image.
+    pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
+        // The nearest text, vertically first: text beside the point on its
+        // line wins over text right above or below it.
+        let distance = |lo: f32, hi: f32, v: f32| (lo - v).max(v - hi).max(0.0);
+        let (index, item, item_x, buf, content) = self.texts().min_by(|a, b| {
+            let key = |(_, item, left, buf, _): &(usize, &Item, f32, &Buffer, &Content)| {
+                let width = buf.size().0.unwrap_or(0.0);
+                (distance(item.y, item.y + item.h, y), distance(*left, left + width, x))
+            };
+            let (ka, kb) = (key(a), key(b));
+            ka.0.total_cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
+        })?;
+        let (lx, ly) = (x - item_x, y - item.y);
+        // The line at that height, or the nearest one.
+        let run = buf
+            .layout_runs()
+            .min_by(|a, b| {
+                let d = |r: &cosmic_text::LayoutRun| distance(r.line_top, r.line_top + r.line_height, ly);
+                d(a).total_cmp(&d(b))
+            })?;
+        let on_line = ly >= run.line_top && ly < run.line_top + run.line_height;
+        let line_start = content.line_starts.get(run.line_i).copied().unwrap_or(0);
+        let under = run.glyphs.iter().find(|g| lx >= g.x && lx < g.x + g.w);
+        let (in_line, link) = match under {
+            Some(g) => {
+                let link = (g.metadata >> META_LINK_SHIFT).checked_sub(1).map(|id| id as u32);
+                (if lx < g.x + g.w / 2.0 { g.start } else { g.end }, link)
+            }
+            // Beside the line: its nearer end.
+            None => {
+                let before = run.glyphs.first().is_none_or(|g| lx < g.x);
+                let end = match before {
+                    true => run.glyphs.iter().map(|g| g.start).min(),
+                    false => run.glyphs.iter().map(|g| g.end).max(),
+                };
+                (end.unwrap_or(0), None)
+            }
+        };
+        Some(Hit {
+            item: index as u32,
+            offset: line_start + in_line as u32,
+            inside: on_line && under.is_some(),
+            link,
+        })
+    }
+
+    /// Destination of link number `id`.
+    pub fn link(&self, id: u32) -> Option<&str> {
+        self.lay.links.get(id as usize).map(String::as_str)
+    }
+
+    /// 1-based source line of the character at `offset` of text item `item`.
+    pub fn line_of(&self, hit: &Hit) -> Option<u32> {
+        match &self.lay.items.get(hit.item as usize)?.kind {
+            Kind::Text { content: Some(content), .. } => Some(self.lines.line_of(content.map.to_source(hit.offset))),
+            _ => None,
+        }
     }
 }
 
@@ -635,7 +823,10 @@ impl Layout {
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
-            Tag::Link { .. } => self.link += 1,
+            Tag::Link { dest_url, .. } => {
+                self.link = Some(self.links.len() as u32);
+                self.links.push(dest_url.to_string());
+            }
             Tag::Image { dest_url, .. } => self.image = Some((dest_url.to_string(), String::new())),
             Tag::MetadataBlock(_) => self.meta = Some(String::new()),
             _ => {}
@@ -706,7 +897,7 @@ impl Layout {
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
             TagEnd::Strong => self.bold = self.bold.saturating_sub(1),
             TagEnd::Strikethrough => self.strike = self.strike.saturating_sub(1),
-            TagEnd::Link => self.link = self.link.saturating_sub(1),
+            TagEnd::Link => self.link = None,
             TagEnd::Image => {
                 if let Some((dest, alt)) = self.image.take() {
                     self.image_block(eng, &dest, &alt);
@@ -734,6 +925,11 @@ impl Layout {
         if let Some(meta) = &mut self.meta {
             meta.push_str(t);
         } else if let Some((_, buf)) = &mut self.code {
+            // The block's text is the source from its first to its last line.
+            if buf.is_empty() {
+                self.code_src.start = self.at.start;
+            }
+            self.code_src.end = self.at.end;
             buf.push_str(t);
         } else if let Some(html) = &mut self.html {
             html.push_str(t);
@@ -746,14 +942,15 @@ impl Layout {
                 italic: self.italic > 0,
                 strike: self.strike > 0,
                 code,
-                link: self.link > 0,
+                link: self.link,
                 // Struck-through text steps back, like the reference
                 // renderers do it.
-                color: match (self.link > 0, self.strike > 0) {
+                color: match (self.link.is_some(), self.strike > 0) {
                     (true, _) => Some(self.theme.link),
                     (false, true) => Some(self.theme.dim),
                     _ => None,
                 },
+                src: self.at.clone(),
             });
         }
     }
@@ -780,8 +977,23 @@ impl Layout {
         y
     }
 
+    /// Add a shape or a piece of decoration, made from the source the
+    /// parser is at.
     fn push(&mut self, y: f32, h: f32, kind: Kind) {
-        self.items.push(Item { y, h, src: self.src, kind });
+        self.items.push(Item { y, h, src: self.at.clone(), kind });
+    }
+
+    /// Add text that is document content; `map` says where it comes from.
+    fn push_text(&mut self, x: f32, y: f32, h: f32, buf: Buffer, color: Rgba, map: TextMap, join: Join) {
+        let src = map.range();
+        self.covered = self.covered.max(src.end);
+        let content = content(&buf, map, join);
+        self.items.push(Item { y, h, src, kind: Kind::Text { x, buf, color, content } });
+    }
+
+    /// Add text that is decoration: a list number, a label.
+    fn push_label(&mut self, x: f32, y: f32, h: f32, buf: Buffer, color: Rgba) {
+        self.push(y, h, Kind::Text { x, buf, color, content: None });
     }
 
     fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgba) {
@@ -814,7 +1026,7 @@ impl Layout {
                 // Lines with CJK glyphs have a slightly lower baseline than
                 // Latin-only ones; follow the text's.
                 let shift = lead.zip(baseline(&buf)).map_or(0.0, |(text, number)| (text - number).round());
-                self.push(y + shift, h, Kind::Text { x, buf, color });
+                self.push_label(x, y + shift, h, buf, color);
             }
             // A quiet gray box: it reports a state, it is not a control.
             Marker::Task(checked) => {
@@ -863,7 +1075,8 @@ impl Layout {
 
         self.code_boxes(&buf, self.x, y);
         let color = if self.heading == Some(6) { self.theme.dim } else { self.text_color() };
-        self.push(y, text_h, Kind::Text { x: self.x, buf, color });
+        let join = if tight { Join::Line } else { Join::Block };
+        self.push_text(self.x, y, text_h, buf, color, span_map(&spans), join);
     }
 
     /// YAML front matter, shown as a quiet key/value header above the
@@ -884,13 +1097,18 @@ impl Layout {
         let widest = keys.iter().map(|k| measure(k).0).fold(0.0, f32::max);
         let key_col = (widest + 2.2 * em).max(4.5 * em).min((self.right - self.x) / 2.0).round();
         for ((_, value), key) in rows.into_iter().zip(keys) {
+            // Each value is found again in the block by its text, which is
+            // good enough to tell which line it is on.
+            let found = self.source[self.at.start as usize..self.at.end as usize].find(value.lines().next().unwrap_or(""));
+            let start = self.at.start + found.unwrap_or(0) as u32;
+            let map = TextMap::from_lines(&value, &self.source, start..self.at.end);
             let span = Span { text: value, ..Span::default() };
             let value = make_buffer(eng, &[span], &value_st, Some(self.right - self.x - key_col));
             let h = measure(&value).1.max(value_st.line_h);
             let y = self.place(eng, h, 0.3 * em, 0.3 * em, value_st.line_h);
             let shift = baseline(&value).zip(baseline(&key)).map_or(0.0, |(v, k)| (v - k).round());
-            self.push(y + shift, key_st.line_h, Kind::Text { x: self.x, buf: key, color: self.theme.dim });
-            self.push(y, h, Kind::Text { x: self.x + key_col, buf: value, color: self.theme.fg });
+            self.push_label(self.x, y + shift, key_st.line_h, key, self.theme.dim);
+            self.push_text(self.x + key_col, y, h, value, self.theme.fg, map, Join::Line);
         }
         let line = self.hairline();
         let y = self.place(eng, line, 1.1 * em, 1.2 * em, line);
@@ -928,13 +1146,17 @@ impl Layout {
     fn code_block(&mut self, eng: &mut Engine, lang: &str, text: &str) {
         let text = code_text(text);
         let plain = || vec![Span { text: text.to_string(), ..Span::default() }];
+        let src = std::mem::replace(&mut self.code_src, 0..0);
+        // An empty block has no text events; it is at the block itself.
+        let src = if text.is_empty() { self.at.start..self.at.start } else { src };
+        let map = TextMap::from_lines(text, &self.source, src);
         // Never wait for the highlighter: show the block now and let
         // `Doc::highlight` color it once the tokens are there.
         match eng.highlighter.try_get(lang, text) {
-            Some(Some(tokens)) => self.mono_block(eng, &code_spans(&tokens, &self.theme), self.theme.fg, lang),
-            Some(None) => self.mono_block(eng, &plain(), self.theme.fg, lang),
+            Some(Some(tokens)) => self.mono_block(eng, &code_spans(&tokens, &self.theme), self.theme.fg, lang, map),
+            Some(None) => self.mono_block(eng, &plain(), self.theme.fg, lang, map),
             None => {
-                self.mono_block(eng, &plain(), self.theme.fg, lang);
+                self.mono_block(eng, &plain(), self.theme.fg, lang, map);
                 let width = self.right - self.x - 2.0 * code_pad(self.em).0;
                 self.uncolored.push_back(Uncolored {
                     item: self.items.len() - 1,
@@ -951,14 +1173,18 @@ impl Layout {
         if html.is_empty() || (html.starts_with("<!--") && html.ends_with("-->")) {
             return;
         }
+        // Shown as written, so it maps to the source line by line.
+        let block = &self.source[self.at.start as usize..self.at.end as usize];
+        let start = self.at.start + (block.len() - block.trim_start().len()) as u32;
+        let map = TextMap::from_lines(html, &self.source, start..self.at.end);
         let span = Span { text: html.to_string(), ..Span::default() };
-        self.mono_block(eng, &[span], self.theme.dim, "");
+        self.mono_block(eng, &[span], self.theme.dim, "", map);
     }
 
     /// A monospace block in a rounded frame (code blocks, raw HTML), with
     /// `label` (the language) in its top right corner. Its text is the last
     /// item pushed.
-    fn mono_block(&mut self, eng: &mut Engine, spans: &[Span], fg: Rgba, label: &str) {
+    fn mono_block(&mut self, eng: &mut Engine, spans: &[Span], fg: Rgba, label: &str, map: TextMap) {
         let em = self.em;
         let st = code_style(em);
         let (pad_x, pad_y) = code_pad(em);
@@ -978,10 +1204,10 @@ impl Layout {
             let first_line = buf.layout_runs().next().map_or(0.0, |run| run.line_w);
             if first_line + em <= width - 2.0 * pad_x - tag_w {
                 let (x, y) = (self.right - pad_x - tag_w, y + (0.55 * em).round());
-                self.push(y, label_style(em).line_h, Kind::Text { x, buf: tag, color: self.theme.dim });
+                self.push_label(x, y, label_style(em).line_h, tag, self.theme.dim);
             }
         }
-        self.push(y + pad_y, text_h, Kind::Text { x: self.x + pad_x, buf, color: fg });
+        self.push_text(self.x + pad_x, y + pad_y, text_h, buf, fg, map, Join::Block);
     }
 
     fn image_block(&mut self, eng: &mut Engine, dest: &str, alt: &str) {
@@ -1029,7 +1255,7 @@ impl Layout {
         let head_st = TextStyle { weight: BOLD, ..text_style(em, 1.5) };
 
         // Pass 1: natural (unwrapped) width of every column.
-        let mut cells: Vec<Vec<Buffer>> = Vec::new();
+        let mut cells: Vec<Vec<(Buffer, TextMap)>> = Vec::new();
         let mut natural = vec![0.0f32; cols];
         for (r, row) in table.rows.iter().enumerate() {
             let style = if r < table.head_rows { &head_st } else { &st };
@@ -1037,7 +1263,7 @@ impl Layout {
             for (c, spans) in row.iter().enumerate() {
                 let buf = make_buffer(eng, spans, style, None);
                 natural[c] = natural[c].max(measure(&buf).0.ceil() + 1.0);
-                bufs.push(buf);
+                bufs.push((buf, span_map(spans)));
             }
             cells.push(bufs);
         }
@@ -1051,7 +1277,7 @@ impl Layout {
         let mut heights = Vec::new();
         for row in &mut cells {
             let mut row_h = st.line_h;
-            for (c, buf) in row.iter_mut().enumerate() {
+            for (c, (buf, _)) in row.iter_mut().enumerate() {
                 let align = match table.aligns.get(c) {
                     Some(Alignment::Center) => Some(Align::Center),
                     Some(Alignment::Right) => Some(Align::Right),
@@ -1088,9 +1314,14 @@ impl Layout {
                 self.rect(self.x, cy - line, table_w, weight, 0.0, self.theme.border);
             }
             let mut cx = self.x;
-            for (buf, width) in row.into_iter().zip(&widths) {
+            for (c, ((buf, map), width)) in row.into_iter().zip(&widths).enumerate() {
                 self.code_boxes(&buf, cx + pad_x, cy + pad_y);
-                self.push(cy + pad_y, heights[r] - 2.0 * pad_y, Kind::Text { x: cx + pad_x, buf, color });
+                let join = match (r, c) {
+                    (0, 0) => Join::Block,
+                    (_, 0) => Join::Line,
+                    _ => Join::Cell,
+                };
+                self.push_text(cx + pad_x, cy + pad_y, heights[r] - 2.0 * pad_y, buf, color, map, join);
                 cx += width + 2.0 * pad_x;
             }
             cy += heights[r] + line;
@@ -1327,7 +1558,7 @@ impl Doc {
                     let mut canvas = Canvas { data: pm.data_mut(), w: w as i32, h: h as i32, ink: &ink };
                     canvas.image(x.round() as i32, (item.y - top).round() as i32, img);
                 }
-                Kind::Text { x, buf, color: default } => {
+                Kind::Text { x, buf, color: default, .. } => {
                     let mut canvas = Canvas { data: pm.data_mut(), w: w as i32, h: h as i32, ink: &ink };
                     let (ox, oy) = (x.round() as i32, (item.y - top).round() as i32);
                     for run in buf.layout_runs() {
@@ -1460,6 +1691,162 @@ fn fill_rrect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, radii: [f32; 4], 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine with the machine's fonts; `None` where there are none.
+    fn engine() -> Option<Engine> {
+        let installed = crate::fonts::installed_for_tests()?;
+        Some(Engine::new(installed, Highlighter::new(), &Choice::default()))
+    }
+
+    fn layout(eng: &mut Engine, markdown: &str, page_w: u32) -> Doc {
+        let theme = Theme::new(Some(Rgb(255, 255, 255)), Some(Rgb(0, 0, 0)), None);
+        let opts = LayoutOpts { page_w, font_px: 16.0, base_dir: PathBuf::from("."), theme };
+        let mut doc = Doc::new(eng, markdown, opts);
+        doc.advance(eng, None, None);
+        doc
+    }
+
+    /// The middle of the first character of `needle` on the page.
+    fn find(doc: &Doc, needle: &str) -> (f32, f32) {
+        for (_, item, x, buf, _) in doc.texts() {
+            for run in buf.layout_runs() {
+                let Some(at) = run.text.find(needle) else { continue };
+                if let Some(g) = run.glyphs.iter().find(|g| g.start == at) {
+                    return (x + g.x + g.w / 2.0, item.y + run.line_top + run.line_height / 2.0);
+                }
+            }
+        }
+        panic!("{needle:?} is not on the page");
+    }
+
+    const SAMPLE: &str = "\
+# Title
+
+First paragraph
+second line with [a link](https://example.com/x) in it.
+
+- item one
+- item **two**
+
+> quoted
+>
+> ```rust
+> let a = 1;
+> let b = 2;
+> ```
+
+| Key | Value |
+|---|---|
+| zeta | omega |
+
+Last &amp; final paragraph.
+";
+
+    fn line_at(doc: &Doc, needle: &str) -> u32 {
+        let (x, y) = find(doc, needle);
+        let hit = doc.hit(x, y).expect("there is text");
+        assert!(hit.inside, "{needle:?} should be under the point");
+        doc.line_of(&hit).unwrap()
+    }
+
+    #[test]
+    fn points_map_to_source_lines() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, SAMPLE, 900);
+        let expect = [
+            ("Title", 1),
+            ("First", 3),
+            ("second", 4),
+            ("a link", 4),
+            ("in it", 4),
+            ("item one", 6),
+            ("two", 7),
+            ("quoted", 9),
+            ("let a", 12),
+            ("b = 2", 13),
+            ("Key", 16),
+            ("zeta", 18),
+            ("omega", 18),
+            ("Last", 20),
+            ("final", 20),
+        ];
+        for (needle, line) in expect {
+            assert_eq!(line_at(&doc, needle), line, "line of {needle:?}");
+        }
+    }
+
+    #[test]
+    fn finds_links_under_a_point() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, SAMPLE, 900);
+        let (x, y) = find(&doc, "a link");
+        let link = doc.hit(x, y).unwrap().link.expect("a link is there");
+        assert_eq!(doc.link(link), Some("https://example.com/x"));
+        let (x, y) = find(&doc, "second");
+        assert_eq!(doc.hit(x, y).unwrap().link, None);
+    }
+
+    #[test]
+    fn points_beside_text_snap_to_it() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, SAMPLE, 900);
+        let (x, y) = find(&doc, "Title");
+        // Far to the right of the heading: its end, and not "inside".
+        let hit = doc.hit(x + 800.0, y).unwrap();
+        assert_eq!((hit.offset, hit.inside), ("Title".len() as u32, false));
+        // Above everything: the start of the first text.
+        let hit = doc.hit(0.0, 0.0).unwrap();
+        assert_eq!((hit.offset, doc.line_of(&hit)), (0, Some(1)));
+    }
+
+    #[test]
+    fn viewport_top_maps_to_a_source_line() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, SAMPLE, 900);
+        assert_eq!(doc.source_line(0), Some(1));
+        let (_, y) = find(&doc, "let b");
+        assert_eq!(doc.source_line(y as u32), Some(13));
+        // Monotonic down the page.
+        let lines: Vec<u32> = (0..doc.height()).step_by(7).filter_map(|y| doc.source_line(y)).collect();
+        assert!(lines.windows(2).all(|w| w[0] <= w[1]), "{lines:?}");
+        assert_eq!(lines.last(), Some(&20));
+    }
+
+    #[test]
+    fn positions_survive_a_relayout() {
+        let Some(mut eng) = engine() else { return };
+        let wide = layout(&mut eng, SAMPLE, 900);
+        // In the same layout an anchor leads back to where it was taken.
+        for y in (0..wide.height().saturating_sub(40)).step_by(13) {
+            let anchor = wide.anchor(y).unwrap();
+            let mut same = layout(&mut eng, SAMPLE, 900);
+            let back = same.resolve(&mut eng, anchor);
+            assert!(back.abs_diff(y) <= 1, "{y} came back as {back}");
+        }
+        // At another width the same source line is at the top again.
+        for needle in ["second", "item one", "let b", "omega", "Last"] {
+            let (_, y) = find(&wide, needle);
+            let line = wide.source_line(y as u32).unwrap();
+            let anchor = wide.anchor(y as u32).unwrap();
+            let mut narrow = layout(&mut eng, SAMPLE, 300);
+            let y = narrow.resolve(&mut eng, anchor);
+            assert_eq!(narrow.source_line(y), Some(line), "at {needle:?}");
+        }
+    }
+
+    #[test]
+    fn source_lines_are_found_on_the_page() {
+        let Some(mut eng) = engine() else { return };
+        let mut doc = layout(&mut eng, SAMPLE, 900);
+        for line in [1, 3, 6, 7, 9, 12, 13, 18, 20] {
+            let y = doc.offset_of_line(&mut eng, line);
+            assert_eq!(doc.source_line(y), Some(line));
+        }
+        // A line with nothing on the page (a table's delimiter row, a blank
+        // line) leads to the next text.
+        let y = doc.offset_of_line(&mut eng, 19);
+        assert_eq!(doc.source_line(y), Some(20));
+    }
 
     #[test]
     fn splits_scripts() {

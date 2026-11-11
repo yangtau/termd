@@ -241,7 +241,13 @@ pub fn scan() -> Installed {
     if let Some(index) = font_cache::load(lang) {
         return Installed { index, took: start.elapsed(), cached: true };
     }
+    let index = index(lang);
+    font_cache::store(&index, lang);
+    Installed { index, took: start.elapsed(), cached: false }
+}
 
+/// Really index the installed fonts.
+fn index(lang: &str) -> Index {
     // On Linux and the BSDs fontconfig knows which fonts the user prefers.
     // The three questions run as concurrent processes while we scan.
     let (cjk_sans, cjk_serif) = (format!("sans-serif:lang={lang}"), format!("serif:lang={lang}"));
@@ -277,9 +283,15 @@ pub fn scan() -> Installed {
         let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
         (out.status.success() && !name.is_empty()).then_some(name)
     });
-    let index = Index { db, defaults };
-    font_cache::store(&index, lang);
-    Installed { index, took: start.elapsed(), cached: false }
+    Index { db, defaults }
+}
+
+/// The installed fonts, for tests: not from the cache, and `None` where
+/// there are none (a build sandbox), in which case text cannot be laid out.
+#[cfg(test)]
+pub fn installed_for_tests() -> Option<Installed> {
+    let index = index(cjk_lang().lang);
+    (!index.db.is_empty()).then(|| Installed { index, took: std::time::Duration::ZERO, cached: false })
 }
 
 fn has_name(face: &FaceInfo, name: &str) -> bool {
