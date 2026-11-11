@@ -94,6 +94,18 @@ pub struct Anchor {
     frac: f32,
 }
 
+impl Anchor {
+    /// Source offset of the first character of the anchored line.
+    pub fn src(self) -> u32 {
+        self.src
+    }
+
+    /// The same position inside the line of text at source offset `src`.
+    pub fn at(self, src: u32) -> Anchor {
+        Anchor { src, ..self }
+    }
+}
+
 /// What is at a point of the page.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hit {
@@ -675,9 +687,14 @@ impl Doc {
 
     /// Page offset of the text that comes from 1-based source `line` (or the
     /// first text after it).
+    #[cfg(test)]
     pub fn offset_of_line(&mut self, eng: &mut Engine, line: u32) -> u32 {
-        let src = self.lines.start_of(line);
-        self.resolve(eng, Anchor { src, frac: 0.0 })
+        self.resolve(eng, Anchor { src: self.start_of_line(line), frac: 0.0 })
+    }
+
+    /// Source offset at which 1-based `line` starts.
+    pub fn start_of_line(&self, line: u32) -> u32 {
+        self.lines.start_of(line)
     }
 
     /// What is at the point (`x`, `y`) of the page image.
@@ -1099,8 +1116,8 @@ impl Layout {
         for ((_, value), key) in rows.into_iter().zip(keys) {
             // Each value is found again in the block by its text, which is
             // good enough to tell which line it is on.
-            let found = self.source[self.at.start as usize..self.at.end as usize].find(value.lines().next().unwrap_or(""));
-            let start = self.at.start + found.unwrap_or(0) as u32;
+            let block = &self.source[self.at.start as usize..self.at.end as usize];
+            let start = self.at.start + block.find(value.lines().next().unwrap_or("")).unwrap_or(0) as u32;
             let map = TextMap::from_lines(&value, &self.source, start..self.at.end);
             let span = Span { text: value, ..Span::default() };
             let value = make_buffer(eng, &[span], &value_st, Some(self.right - self.x - key_col));

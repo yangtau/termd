@@ -51,6 +51,7 @@ environment.systemPackages = [ inputs.termd.packages.${pkgs.system}.default ];
 | `d` / `u` | 半页 |
 | `g` / `G` | 顶部 / 底部 |
 | `+` / `-` / `0` | 放大 / 缩小 / 还原 |
+| `e` | 用 `$VISUAL` / `$EDITOR` 打开文件，光标在视口顶部对应的源码行；退出编辑器后回到原来的位置 |
 | `r` | 重新加载（文件变化时也会自动重载） |
 | `q` / `Esc` | 退出 |
 
