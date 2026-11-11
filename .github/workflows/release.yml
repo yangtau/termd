@@ -1,16 +1,24 @@
 name: Release
 
-# 推送 v* 标签时触发：构建各平台二进制，发布到 GitHub Release，
+# 推送 v* 标签，或在 Actions 页面手动运行（填写版本号，会在当前提交上创建标签）时触发：
+# 构建各平台二进制，发布到 GitHub Release，
 # 然后把新版本的哈希写回默认分支的 nix/releases.json，供 flake 使用。
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布的版本号，不带 v，例如 0.1.0（必须与 Cargo.toml 一致）"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
 
 jobs:
   build:
@@ -32,8 +40,8 @@ jobs:
         shell: bash
         run: |
           cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-          if [ "v${cargo_version}" != "${GITHUB_REF_NAME}" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}"
+          if [ "v${cargo_version}" != "${TAG}" ]; then
+            echo "::error::Tag ${TAG} does not match Cargo.toml version ${cargo_version}"
             exit 1
           fi
 
@@ -54,7 +62,7 @@ jobs:
         id: package
         shell: bash
         run: |
-          name="termd-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="termd-${TAG}-${{ matrix.target }}"
           mkdir -p dist
           bin="target/${{ matrix.target }}/release/termd"
           strip "$bin" || true
@@ -86,14 +94,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$GITHUB_REF_NAME" dist/* \
+            gh release create "$TAG" dist/* \
               --repo "$GITHUB_REPOSITORY" \
-              --title "$GITHUB_REF_NAME" \
-              --generate-notes \
-              --verify-tag
+              --title "$TAG" \
+              --target "$GITHUB_SHA" \
+              --generate-notes
           fi
 
       - uses: actions/upload-artifact@v4
@@ -126,7 +134,7 @@ jobs:
           )
           entry='{}'
           while read -r hex file; do
-            target="${file#termd-${GITHUB_REF_NAME}-}"
+            target="${file#termd-${TAG}-}"
             target="${target%.tar.gz}"
             system="${systems[$target]:-}"
             [ -n "$system" ] || { echo "::error::unknown target $target"; exit 1; }
@@ -155,7 +163,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "nix: add release ${GITHUB_REF_NAME}"
+          git commit -am "nix: add release ${TAG}"
           for i in 1 2 3 4; do
             git push && exit 0
             git pull --rebase
