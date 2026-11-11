@@ -16,8 +16,8 @@ use crate::highlight::{Highlighter, Token};
 use crate::source::{Lines, TextMap};
 use crate::theme::{Rgb, Rgba, Theme};
 use cosmic_text::{
-    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent,
-    SwashImage, Weight, Wrap,
+    Align, Attrs, Buffer, Color, Family, FontSystem, LayoutGlyph, LayoutRun, Metrics, Shaping, Style,
+    SwashCache, SwashContent, SwashImage, Weight, Wrap,
 };
 use image::RgbaImage;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -34,6 +34,11 @@ use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 const META_CODE: usize = 1;
 const META_STRIKE: usize = 2;
 const META_LINK: usize = 4;
+/// The glyph that ends a piece of inline code, with the room for its
+/// background in its advance (see `make_buffer`).
+const META_CODE_END: usize = 8;
+/// Only on a buffer's default attributes, so that no span equals them.
+const META_BASE: usize = 16;
 const META_LINK_SHIFT: u32 = 8;
 
 const HEADING_SCALE: [f32; 6] = [1.75, 1.35, 1.15, 1.0, 0.9, 0.85];
@@ -41,6 +46,9 @@ const BODY_LINE: f32 = 1.65;
 const HEADING_LINE: f32 = 1.3;
 const CODE_SCALE: f32 = 0.88;
 const CODE_LINE: f32 = 1.55;
+/// How far the background of inline code reaches beyond its text on each
+/// side, in em of the text around it.
+const CODE_PAD: f32 = 0.3;
 /// Content column width limit, in em.
 const MAX_WIDTH_EM: f32 = 46.0;
 /// Indent of a list level, in em.
@@ -313,7 +321,6 @@ fn make_buffer(eng: &mut Engine, spans: &[Span], st: &TextStyle, width: Option<f
     let fonts = &eng.fonts;
     let mut buf = Buffer::new(&mut eng.fs, Metrics::new(st.size, st.line_h));
     buf.set_wrap(Wrap::WordOrGlyph);
-    buf.set_size(width, None);
 
     // Every run names its family and a weight that family has, so
     // cosmic-text never needs to go looking for a fallback font.
@@ -321,11 +328,24 @@ fn make_buffer(eng: &mut Engine, spans: &[Span], st: &TextStyle, width: Option<f
         let fam = fonts.family(face, cjk);
         Attrs::new().family(Family::Name(&fam.name)).weight(Weight(fam.weight(weight)))
     };
-    let base = attrs(false, st.face, st.weight);
+    // cosmic-text does not keep a span whose attributes equal the default
+    // ones, and then shapes an ASCII word that starts in another span (the
+    // "j /" of "`j` / `k`") entirely in that span's font. With a mark of
+    // their own the defaults equal no span.
+    let base = attrs(false, st.face, st.weight).metadata(META_BASE);
     let mut rich = Vec::new();
-    for s in spans {
+    for (i, s) in spans.iter().enumerate() {
         let weight = if s.bold { BOLD.max(st.weight) } else { st.weight };
         let face = if s.code { Face::Mono } else { st.face };
+        let size = if s.code { st.size * CODE_SCALE } else { st.size };
+        // The background of inline code is wider than its text. The room
+        // for that is letter spacing: after the last character of the
+        // code, and after the character before its first one. (A line that
+        // starts with code has no such character: see `indent`.)
+        let next_is_code = spans.get(i + 1).is_some_and(|next| next.code);
+        let room = (s.code || next_is_code).then_some(CODE_PAD * st.size / size);
+        let last = s.text.char_indices().next_back().map_or(0, |(at, _)| at);
+        let mut at = 0;
         for (piece, cjk) in script_runs(&s.text) {
             let mut a = attrs(cjk, face, weight);
             if s.italic {
@@ -333,19 +353,54 @@ fn make_buffer(eng: &mut Engine, spans: &[Span], st: &TextStyle, width: Option<f
             }
             let flag = |on: bool, flag: usize| if on { flag } else { 0 };
             let link = s.link.map_or(0, |id| (id as usize + 1) << META_LINK_SHIFT | META_LINK);
-            a = a.metadata(flag(s.code, META_CODE) | flag(s.strike, META_STRIKE) | link);
+            let meta = flag(s.code, META_CODE) | flag(s.strike, META_STRIKE) | link;
+            a = a.metadata(meta);
             if s.code {
-                a = a.metrics(Metrics::new(st.size * CODE_SCALE, st.line_h));
+                a = a.metrics(Metrics::new(size, st.line_h));
             }
             if let Some(c) = s.color {
                 a = a.color(color(c));
             }
-            rich.push((piece, a));
+            match room {
+                Some(room) if at + piece.len() == s.text.len() => {
+                    let (head, tail) = piece.split_at(last - at);
+                    if !head.is_empty() {
+                        rich.push((head, a.clone()));
+                    }
+                    rich.push((tail, a.letter_spacing(room).metadata(meta | flag(s.code, META_CODE_END))));
+                }
+                _ => rich.push((piece, a)),
+            }
+            at += piece.len();
         }
     }
     buf.set_rich_text(rich, &base, Shaping::Advanced, None);
-    buf.shape_until_scroll(&mut eng.fs, false);
+    wrap(&mut eng.fs, &mut buf, width);
     buf
+}
+
+/// How far to the right of where it was laid out a line of `buf` is: by
+/// the padding of the background of inline code, if it starts with that, so
+/// that the background and not the code begins where other lines begin.
+/// (Only lines that begin at the left; the others have room there.)
+fn indent(buf: &Buffer, run: &LayoutRun) -> f32 {
+    let code = run.glyphs.first().is_some_and(|g| g.metadata & META_CODE != 0);
+    let left = matches!(buf.lines[run.line_i].align(), None | Some(Align::Left));
+    if code && left && !run.rtl { CODE_PAD * buf.metrics().font_size } else { 0.0 }
+}
+
+/// Break `buf` into lines no wider than `width`, their `indent` included.
+fn wrap(fs: &mut FontSystem, buf: &mut Buffer, width: Option<f32>) {
+    buf.set_size(width, None);
+    buf.shape_until_scroll(fs, false);
+    let Some(width) = width else { return };
+    // Nothing says how wide a line may be before it is known how it
+    // starts; narrower lines for all of them leave room for any indent.
+    let most = buf.layout_runs().map(|run| indent(buf, &run)).fold(0.0, f32::max);
+    if buf.layout_runs().any(|run| run.line_w + indent(buf, &run) > width) {
+        buf.set_size(Some(width - most), None);
+        buf.shape_until_scroll(fs, false);
+    }
 }
 
 /// What a content text item needs to know about its text: `map` says where
@@ -372,7 +427,7 @@ fn span_map(spans: &[Span]) -> TextMap {
 /// (widest line, total height) of a shaped buffer.
 fn measure(buf: &Buffer) -> (f32, f32) {
     buf.layout_runs().fold((0.0, 0.0), |(w, h): (f32, f32), run| {
-        (w.max(run.line_w), h.max(run.line_top + run.line_height))
+        (w.max(run.line_w + indent(buf, &run)), h.max(run.line_top + run.line_height))
     })
 }
 
@@ -521,6 +576,23 @@ fn code_lang(kind: &CodeBlockKind) -> String {
             info.split(|c: char| c == ',' || c.is_whitespace()).next().unwrap_or("").to_string()
         }
         CodeBlockKind::Indented => String::new(),
+    }
+}
+
+/// What a highlight of glyph `i` of a line covers, from where to where:
+/// inline code with the padding of its background (see `code_boxes`), the
+/// text before it without the room that its advance holds for that padding.
+fn lit_extent(glyphs: &[LayoutGlyph], i: usize, pad: f32) -> (f32, f32) {
+    let code = |g: &LayoutGlyph| g.metadata & META_CODE != 0;
+    let last = |g: &LayoutGlyph| g.metadata & META_CODE_END != 0;
+    let (g, before, after) = (&glyphs[i], i.checked_sub(1).map(|i| &glyphs[i]), glyphs.get(i + 1));
+    if code(g) {
+        let opens = before.is_none_or(|b| !code(b) || last(b));
+        // Only code that goes on in the next line ends without its room.
+        let cut = !last(g) && after.is_none_or(|a| !code(a));
+        (g.x - if opens { pad } else { 0.0 }, g.x + g.w + if cut { pad } else { 0.0 })
+    } else {
+        (g.x, g.x + g.w - if after.is_some_and(code) { pad } else { 0.0 })
     }
 }
 
@@ -845,6 +917,7 @@ impl Doc {
                 d(a).total_cmp(&d(b))
             })?;
         let on_line = ly >= run.line_top && ly < run.line_top + run.line_height;
+        let lx = lx - indent(buf, &run);
         let line_start = content.line_starts.get(run.line_i).copied().unwrap_or(0);
         let under = run.glyphs.iter().find(|g| lx >= g.x && lx < g.x + g.w);
         let (in_line, character, link) = match under {
@@ -873,8 +946,8 @@ impl Doc {
 
     /// The highlight for the text between `from` and `to`, as rectangles
     /// (x, y, width, height) on the page, as far as they show between page
-    /// offsets `top` and `bottom`.
-    pub fn selection_rects(&self, from: Pos, to: Pos, top: f32, bottom: f32) -> Vec<[f32; 4]> {
+    /// offsets `top` and `bottom`, each with the layer its text is on.
+    pub fn selection_rects(&self, from: Pos, to: Pos, top: f32, bottom: f32) -> Vec<(u16, [f32; 4])> {
         let mut rects = Vec::new();
         for (index, item, x, buf, content) in self.texts() {
             let index = index as u32;
@@ -889,16 +962,17 @@ impl Doc {
                     continue;
                 }
                 let line_start = content.line_starts.get(run.line_i).copied().unwrap_or(0);
-                let selected = run
-                    .glyphs
-                    .iter()
-                    .filter(|g| line_start + (g.start as u32) < end && line_start + g.end as u32 > start);
-                let extent = selected.fold(None, |extent: Option<(f32, f32)>, g| {
-                    let (lo, hi) = extent.unwrap_or((g.x, g.x + g.w));
-                    Some((lo.min(g.x), hi.max(g.x + g.w)))
+                let glyphs = run.glyphs;
+                let selected = (0..glyphs.len())
+                    .filter(|&i| line_start + (glyphs[i].start as u32) < end && line_start + glyphs[i].end as u32 > start);
+                let pad = CODE_PAD * buf.metrics().font_size;
+                let extent = selected.fold(None, |extent: Option<(f32, f32)>, i| {
+                    let (g_lo, g_hi) = lit_extent(glyphs, i, pad);
+                    let (lo, hi) = extent.unwrap_or((g_lo, g_hi));
+                    Some((lo.min(g_lo), hi.max(g_hi)))
                 });
                 let (lo, hi) = match extent {
-                    Some((lo, hi)) => (x + lo, x + hi),
+                    Some((lo, hi)) => (x + indent(buf, &run) + lo, x + indent(buf, &run) + hi),
                     // An empty line inside the selection still shows.
                     None if run.glyphs.is_empty() && line_start >= start && line_start < end => {
                         (x, x + (0.4 * self.lay.em).round())
@@ -911,7 +985,7 @@ impl Doc {
                     None => (lo, hi),
                 };
                 if lo < hi {
-                    rects.push([lo, line_top, hi - lo, run.line_height]);
+                    rects.push((item.layer, [lo, line_top, hi - lo, run.line_height]));
                 }
             }
         }
@@ -1025,8 +1099,15 @@ impl Doc {
     }
 
     /// Frame of code block `code` on the page: x, y, width, height.
+    #[cfg(test)]
     pub fn code_frame(&self, code: usize) -> [f32; 4] {
         self.lay.codes[code].frame
+    }
+
+    /// Where the text of code block `code` starts and ends.
+    pub fn code_span(&self, code: usize) -> (Pos, Pos) {
+        let item = self.lay.codes[code].item as u32;
+        (Pos { item, offset: 0 }, Pos { item, offset: u32::MAX })
     }
 
     /// The text of code block `code`, or with `fenced` the block as it is
@@ -1451,16 +1532,24 @@ impl Layout {
     /// (`x`, `y`). Pushed before the text so they end up underneath.
     fn code_boxes(&mut self, buf: &Buffer, x: f32, y: f32) {
         let size = buf.metrics().font_size;
-        let code_h = (size * 1.32).round();
-        let pad = (size * 0.2).round();
+        let code_h = (size * 1.38).round();
+        let pad = CODE_PAD * size;
         let mut boxes: Vec<(f32, f32, f32)> = Vec::new(); // x0, x1, top
         for run in buf.layout_runs() {
             let top = run.line_top + ((run.line_height - code_h) / 2.0).round();
+            let dx = indent(buf, &run);
             let mut open: Option<(f32, f32)> = None;
             for g in run.glyphs {
                 if g.metadata & META_CODE != 0 {
-                    let (x0, _) = open.unwrap_or((g.x, 0.0));
-                    open = Some((x0.min(g.x), g.x + g.w));
+                    let gx = dx + g.x;
+                    let (x0, _) = open.unwrap_or((gx - pad, 0.0));
+                    // The last glyph has the room after it in its advance;
+                    // code that goes on in the next line ends without it.
+                    let room = if g.metadata & META_CODE_END != 0 { 0.0 } else { pad };
+                    open = Some((x0.min(gx - pad), gx + g.w + room));
+                    if room == 0.0 {
+                        boxes.extend(open.take().map(|(x0, x1)| (x0, x1, top)));
+                    }
                 } else if let Some((x0, x1)) = open.take() {
                     boxes.push((x0, x1, top));
                 }
@@ -1470,8 +1559,8 @@ impl Layout {
             }
         }
         for (x0, x1, top) in boxes {
-            let (bx, w) = ((x + x0 - pad).round(), (x1 - x0 + 2.0 * pad).round());
-            self.rect(bx, y + top, w, code_h, size * 0.28, self.theme.code_bg);
+            let (left, right) = ((x + x0).round(), (x + x1).round());
+            self.rect(left, y + top, right - left, code_h, size * 0.26, self.theme.code_bg);
         }
     }
 
@@ -1663,8 +1752,7 @@ impl Layout {
                 for l in &mut buf.lines {
                     l.set_align(align);
                 }
-                buf.set_size(Some(widths[c]), None);
-                buf.shape_until_scroll(&mut eng.fs, false);
+                wrap(&mut eng.fs, buf, Some(widths[c]));
                 row_h = row_h.max(measure(buf).1);
             }
             heights.push(row_h + 2.0 * pad_y);
@@ -1698,9 +1786,13 @@ impl Layout {
             layer: self.layer,
         });
 
+        // Tints are translucent, so the shapes of a table keep clear of
+        // each other: the header's fill and the rules stay inside the frame.
+        let inner_w = table_w - 2.0 * line;
         if table.head_rows > 0 {
-            let radii = [radius, radius, 0.0, 0.0];
-            self.push(y, head_h, Kind::Rect { x, w: table_w, radii, color: self.theme.table_head });
+            let radii = [radius - line, radius - line, 0.0, 0.0];
+            let fill = Kind::Rect { x: x + line, w: inner_w, radii, color: self.theme.table_head };
+            self.push(y + line, head_h - line, fill);
         }
         let color = self.text_color();
         let mut cy = y + line;
@@ -1708,7 +1800,7 @@ impl Layout {
             if r > 0 {
                 // The rule under the header is twice as heavy.
                 let weight = if r == table.head_rows { 2.0 * line } else { line };
-                self.rect(x, cy - line, table_w, weight, 0.0, self.theme.border);
+                self.rect(x + line, cy - line, inner_w, weight, 0.0, self.theme.border);
             }
             let mut cx = x;
             for (c, ((buf, map), width)) in row.into_iter().zip(&widths).enumerate() {
@@ -1743,6 +1835,10 @@ fn longest_word(buf: &Buffer) -> f32 {
                 longest = longest.max(g.w);
                 word = 0.0;
             } else {
+                // Code may come to start a line, which takes an indent.
+                if word == 0.0 && g.metadata & META_CODE != 0 {
+                    word = CODE_PAD * buf.metrics().font_size;
+                }
                 word += g.w;
                 longest = longest.max(word);
             }
@@ -1950,12 +2046,25 @@ impl Doc {
     /// Rasterize a rectangle of the page as straight RGBA: `width` pixels
     /// from `x0`, `height` from `y0`. `layer` 0 is the page; layer `n` is
     /// sideways scrolling table number `n`, whose image starts at the
-    /// table's left edge and is as wide as the whole table.
-    pub fn render(&self, eng: &mut Engine, layer: u16, x0: u32, y0: u32, width: u32, height: u32) -> Vec<u8> {
+    /// table's left edge and is as wide as the whole table. With `lit` the
+    /// page stands on the selection color: what the viewer shows in place
+    /// of the selected parts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(
+        &self,
+        eng: &mut Engine,
+        layer: u16,
+        x0: u32,
+        y0: u32,
+        width: u32,
+        height: u32,
+        lit: bool,
+    ) -> Vec<u8> {
         let (w, h) = (width.max(1), height.max(1));
         let mut pm = Pixmap::new(w, h).expect("non-zero pixmap size");
         let theme = &self.lay.theme;
-        if let Some(bg) = theme.page {
+        let ground = if lit { Some(theme.select) } else { theme.page };
+        if let Some(bg) = ground {
             pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
         }
 
@@ -1994,7 +2103,7 @@ impl Doc {
                             line_join: tiny_skia::LineJoin::Round,
                             ..Stroke::default()
                         };
-                        pm.stroke_path(&path, &paint(theme.check_mark), &stroke, shift, None);
+                        pm.stroke_path(&path, &paint(theme.paper.opaque()), &stroke, shift, None);
                     }
                 }
                 Kind::CopyIcon { x, color } => {
@@ -2041,8 +2150,9 @@ impl Doc {
                         if line_top - slack >= bottom || line_top + run.line_height + slack <= top {
                             continue;
                         }
+                        let dx = indent(buf, &run);
                         for g in run.glyphs {
-                            let pg = g.physical((0.0, run.line_y), 1.0);
+                            let pg = g.physical((dx, run.line_y), 1.0);
                             let c = g.color_opt.map_or(*default, |c| Rgba(c.r(), c.g(), c.b(), c.a()));
                             if let Some(img) = eng.swash.get_image(&mut eng.fs, pg.cache_key) {
                                 let (gx, gy) = (ox + pg.x + img.placement.left, oy + pg.y - img.placement.top);
@@ -2057,9 +2167,9 @@ impl Doc {
                                 if g.metadata & flag == 0 {
                                     continue;
                                 }
-                                let (x0, mut x1) = (g.x, g.x + g.w);
+                                let (x0, mut x1) = (dx + g.x, dx + g.x + g.w);
                                 while let Some(next) = glyphs.next_if(|n| n.metadata & flag != 0) {
-                                    x1 = next.x + next.w;
+                                    x1 = dx + next.x + next.w;
                                 }
                                 let c = g.color_opt.map_or(*default, |c| Rgba(c.r(), c.g(), c.b(), c.a()));
                                 let thick = (g.font_size * weight).round().max(1.0);
@@ -2073,9 +2183,14 @@ impl Doc {
             }
         }
 
+        // On its own ground every pixel is opaque already. A transparent
+        // page is blended with the terminal's background here where that is
+        // known, and leaves it to the terminal otherwise.
         let mut data = pm.take();
-        if theme.page.is_none() {
-            unpremultiply(&mut data);
+        match (ground, theme.behind) {
+            (Some(_), _) => {}
+            (None, Some(bg)) => flatten(&mut data, bg),
+            (None, None) => unpremultiply(&mut data),
         }
         data
     }
@@ -2085,27 +2200,46 @@ impl Doc {
         self.advance(eng, None, None);
         self.highlight(eng, None);
         let (w, h) = (self.lay.page_w as u32, self.height.max(1));
-        RgbaImage::from_raw(w, h, self.render(eng, 0, 0, 0, w, h))
+        RgbaImage::from_raw(w, h, self.render(eng, 0, 0, 0, w, h, false))
     }
 }
 
-/// Premultiplied → straight alpha, which is what the Kitty protocol takes.
-fn unpremultiply(data: &mut [u8]) {
-    // Only translucent pixels change, and those are just glyph and shape
-    // edges; whole blocks of transparent or opaque pixels are skipped with a
-    // check the compiler can vectorize.
+/// Call `change` on the translucent pixels of premultiplied `data`. Those
+/// are few (the edges of glyphs and shapes, and tinted fills), so whole
+/// blocks of transparent or opaque pixels are skipped with a check the
+/// compiler can vectorize.
+fn for_translucent(data: &mut [u8], change: impl Fn(&mut [u8])) {
     for block in data.chunks_mut(64 * 4) {
         let translucent = |px: &[u8]| px[3].wrapping_sub(1) < 254;
         if !block.chunks_exact(4).fold(false, |any, px| any | translucent(px)) {
             continue;
         }
         for px in block.chunks_exact_mut(4).filter(|px| translucent(px)) {
-            let a = px[3] as u32;
-            for c in &mut px[..3] {
-                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
-            }
+            change(px);
         }
     }
+}
+
+/// Premultiplied → straight alpha, which is what the Kitty protocol takes.
+fn unpremultiply(data: &mut [u8]) {
+    for_translucent(data, |px| {
+        let a = px[3] as u32;
+        for c in &mut px[..3] {
+            *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+        }
+    });
+}
+
+/// Put what has been drawn on the background color `bg`: every pixel that
+/// was touched becomes opaque, the rest stays transparent.
+fn flatten(data: &mut [u8], bg: Rgb) {
+    for_translucent(data, |px| {
+        let inv = 255 - px[3] as u32;
+        for (c, bg) in px.iter_mut().zip([bg.0, bg.1, bg.2]) {
+            *c = (*c as u32 + div255(bg as u32 * inv)).min(255) as u8;
+        }
+        px[3] = 255;
+    });
 }
 
 fn paint(c: Rgba) -> Paint<'static> {
@@ -2176,7 +2310,7 @@ mod tests {
             for run in buf.layout_runs() {
                 let Some(at) = run.text.find(needle) else { continue };
                 if let Some(g) = run.glyphs.iter().find(|g| g.start == at) {
-                    return (x + g.x + g.w / 2.0, item.y + run.line_top + run.line_height / 2.0);
+                    return (x + indent(buf, &run) + g.x + g.w / 2.0, item.y + run.line_top + run.line_height / 2.0);
                 }
             }
         }
@@ -2376,7 +2510,8 @@ Last &amp; final paragraph.
         // breaks into well over three lines.
         let doc = layout(&mut eng, SAMPLE, 100);
         let (from, to) = (before(&doc, "First"), before(&doc, "item one"));
-        let rects = doc.selection_rects(from, to, 0.0, doc.height() as f32);
+        let rects: Vec<[f32; 4]> =
+            doc.selection_rects(from, to, 0.0, doc.height() as f32).into_iter().map(|(_, rect)| rect).collect();
         // One rectangle per line, each right under the one before.
         assert!(rects.len() >= 3, "{rects:?}");
         for pair in rects.windows(2) {
@@ -2492,7 +2627,9 @@ Last &amp; final paragraph.
         // Its highlight is drawn where it shows, cut off at the table's edge.
         let rects = doc.selection_rects(from, to, 0.0, doc.height() as f32);
         assert_eq!(rects.len(), 1);
-        assert!((rects[0][0] - (x - scroll)).abs() < 12.0 && rects[0][0] + rects[0][2] <= t.x + t.w + 0.5);
+        let (layer, rect) = rects[0];
+        assert_eq!(layer, t.layer);
+        assert!((rect[0] - (x - scroll)).abs() < 12.0 && rect[0] + rect[2] <= t.x + t.w + 0.5);
         // The first column is out of sight now: nothing of it is highlighted.
         let (from, to) = doc.block_at(before(&doc, "word0x0"));
         assert!(doc.selection_rects(from, to, 0.0, doc.height() as f32).is_empty());
@@ -2513,6 +2650,15 @@ Last &amp; final paragraph.
         assert_eq!(doc.copy_button(x + w - 20.0, y + 16.0), Some(0));
         assert_eq!(doc.copy_button(x + 20.0, y + 16.0), None);
         assert_eq!(doc.code_blocks(0.0, y - 1.0), Vec::<usize>::new());
+        // What lights up when it is copied is its text, a rectangle for each
+        // line, well inside the frame.
+        let [.., h] = doc.code_frame(0);
+        let (from, to) = doc.code_span(0);
+        let lit = doc.selection_rects(from, to, 0.0, doc.height() as f32);
+        assert_eq!(lit.len(), 2);
+        for (_, [lx, ly, lw, lh]) in lit {
+            assert!(lx > x + 4.0 && lx + lw < x + w - 4.0 && ly > y + 4.0 && ly + lh < y + h - 4.0);
+        }
     }
 
     #[test]
@@ -2558,6 +2704,145 @@ Last &amp; final paragraph.
         let mut px = [50, 25, 0, 100, 9, 9, 9, 255, 0, 0, 0, 0];
         unpremultiply(&mut px);
         assert_eq!(px, [128, 64, 0, 100, 9, 9, 9, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn flattens_onto_the_background() {
+        // Premultiplied: half of (200, 100, 0), an opaque pixel, an untouched one.
+        let mut px = [100, 50, 0, 128, 9, 9, 9, 255, 0, 0, 0, 0];
+        flatten(&mut px, Rgb(255, 255, 255));
+        assert_eq!(px, [227, 177, 127, 255, 9, 9, 9, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_known_background_leaves_nothing_to_blend() {
+        let Some(mut eng) = engine() else { return };
+        let markdown = "Text with `code`, a [link](x) and ~~more~~.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- [x] done\n";
+        // The terminal told its background: only opaque and untouched pixels.
+        let doc = layout(&mut eng, markdown, 600);
+        let pixels = doc.render(&mut eng, 0, 0, 0, 600, doc.height(), false);
+        let alphas = |pixels: &[u8]| pixels.chunks_exact(4).map(|px| px[3]).collect::<std::collections::BTreeSet<u8>>();
+        assert_eq!(alphas(&pixels).into_iter().collect::<Vec<_>>(), [0, 255]);
+        // The highlighted variant stands on the selection color throughout.
+        let lit = doc.render(&mut eng, 0, 0, 0, 600, doc.height(), true);
+        assert_eq!(alphas(&lit).into_iter().collect::<Vec<_>>(), [255]);
+        let select = doc.lay.theme.select;
+        assert_eq!(lit[..3], [select.0, select.1, select.2]);
+        // It did not: the terminal has to blend, so the edges stay translucent.
+        let theme = Theme::new(None, None, None);
+        let opts = LayoutOpts { page_w: 600, font_px: 16.0, base_dir: PathBuf::from("."), theme, scroll_tables: true };
+        let mut doc = Doc::new(&mut eng, markdown, opts);
+        doc.advance(&mut eng, None, None);
+        assert!(alphas(&doc.render(&mut eng, 0, 0, 0, 600, doc.height(), false)).len() > 2);
+    }
+
+    #[test]
+    fn inline_code_has_room_for_its_background() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, "press `j` / `k` now\n", 800);
+        let Some(Kind::Text { buf, .. }) = doc.lay.items.iter().map(|item| &item.kind).find(|k| matches!(k, Kind::Text { .. }))
+        else {
+            panic!("no text")
+        };
+        let run = buf.layout_runs().next().unwrap();
+        let glyph = |text: &str| run.glyphs.iter().find(|g| &run.text[g.start..g.end] == text).unwrap();
+        let (j, slash, k) = (glyph("j"), glyph("/"), glyph("k"));
+        // The text between two pieces of code is set in the body face, not
+        // in the font of the code before it.
+        assert_ne!(slash.font_id, j.font_id);
+        assert_eq!(k.font_id, j.font_id);
+        // Each background keeps clear of the slash, by the same distance on
+        // either side.
+        let boxes: Vec<(f32, f32)> = doc
+            .lay
+            .items
+            .iter()
+            .filter_map(|item| match item.kind {
+                Kind::Rect { x, w, .. } => Some((x, x + w)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(boxes.len(), 2);
+        let origin = doc.lay.items.iter().find_map(|item| match item.kind {
+            Kind::Text { x, .. } => Some(x),
+            _ => None,
+        });
+        let slash_x = origin.unwrap() + slash.x;
+        let (before, after) = (slash_x - boxes[0].1, boxes[1].0 - (slash_x + slash.w));
+        assert!(before > 2.0 && (before - after).abs() <= 1.0, "{before} before, {after} after");
+    }
+
+    #[test]
+    fn a_selection_covers_the_background_of_inline_code() {
+        let Some(mut eng) = engine() else { return };
+        let boxes = |doc: &Doc| -> Vec<[f32; 2]> {
+            let rects = doc.lay.items.iter().filter_map(|item| match item.kind {
+                Kind::Rect { x, w, .. } => Some([x, x + w]),
+                _ => None,
+            });
+            rects.collect()
+        };
+        let lit = |doc: &Doc, from: u32, to: u32| -> Vec<[f32; 2]> {
+            let item = doc.lay.items.iter().position(|item| matches!(item.kind, Kind::Text { .. })).unwrap() as u32;
+            let (from, to) = (Pos { item, offset: from }, Pos { item, offset: to });
+            let rects = doc.selection_rects(from, to, 0.0, doc.height() as f32);
+            rects.into_iter().map(|(_, [x, _, w, _])| [x, x + w]).collect()
+        };
+        let close = |a: f32, b: f32| (a - b).abs() <= 1.0;
+
+        // "press j / k now": the code alone lights up all of its background,
+        // the text before it none of it.
+        let doc = layout(&mut eng, "press `j` / `k` now\n", 800);
+        let (boxes_, j, press) = (boxes(&doc), lit(&doc, 6, 7), lit(&doc, 0, 6));
+        assert!(close(j[0][0], boxes_[0][0]) && close(j[0][1], boxes_[0][1]), "{j:?} for {boxes_:?}");
+        assert!(close(press[0][1], boxes_[0][0]), "{press:?} before {boxes_:?}");
+
+        // Code that takes several lines: on each, the highlight reaches as
+        // far as the background, which is wider than the code.
+        let doc = layout(&mut eng, "see `aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm` end\n", 420);
+        let (boxes_, all) = (boxes(&doc), lit(&doc, 0, u32::MAX));
+        assert!(boxes_.len() >= 2 && boxes_.len() == all.len(), "{boxes_:?} {all:?}");
+        for (b, l) in boxes_.iter().zip(&all) {
+            assert!(l[0] <= b[0] + 1.0 && l[1] >= b[1] - 1.0, "{l:?} does not cover {b:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_starts_with_inline_code_starts_with_its_background() {
+        let Some(mut eng) = engine() else { return };
+        let long = "`aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp`";
+        let doc = layout(&mut eng, &format!("{long} and then\nsome more text that fills the lines to their end.\n"), 420);
+        let (left, right) = (doc.lay.x, doc.lay.right);
+        let boxes: Vec<[f32; 2]> = doc
+            .lay
+            .items
+            .iter()
+            .filter_map(|item| match item.kind {
+                Kind::Rect { x, w, .. } => Some([x, x + w]),
+                _ => None,
+            })
+            .collect();
+        // The code takes several lines, and each begins with it.
+        assert!(boxes.len() >= 2, "{boxes:?}");
+        for b in &boxes {
+            assert!((b[0] - left).abs() <= 1.0 && b[1] <= right + 1.0, "{b:?} in {left}..{right}");
+        }
+        // The code itself is further in, and found there by the pointer.
+        let (x, y) = find(&doc, "aaaa");
+        let item = doc.texts().next().unwrap().0 as u32;
+        let first = doc.selection_rects(Pos { item, offset: 0 }, Pos { item, offset: 1 }, 0.0, 1e6);
+        let [lx, _, lw, _] = first[0].1;
+        assert!((lx - left).abs() <= 1.0 && x - lx > lw / 2.0 && x < lx + lw, "{x} in {lx}+{lw}");
+        let hit = doc.hit(x, y).unwrap();
+        assert_eq!((hit.item, hit.character, hit.inside), (item, 0, true));
+        // Lines of plain text start at the edge as before, and no line is
+        // longer than the column.
+        for (_, _, x, buf, _) in doc.texts() {
+            assert_eq!(x, left);
+            for run in buf.layout_runs() {
+                assert!(x + indent(buf, &run) + run.line_w <= right + 0.5, "{}", run.text);
+            }
+        }
     }
 
     #[test]

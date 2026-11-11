@@ -1,9 +1,18 @@
 //! Colors.
 //!
-//! The page has no background of its own: it is drawn on transparent pixels
-//! so the terminal's background (including its opacity or blur) shows
-//! through. The other colors are tints between the terminal's background and
-//! text colors, so the page fits whatever color scheme the terminal uses.
+//! The page has no background of its own: where nothing is drawn its pixels
+//! are transparent, so the terminal's background (including its opacity or
+//! blur) shows through. The other colors are tints: the text color at some
+//! strength over whatever is behind, so the page fits the color scheme the
+//! terminal uses.
+//!
+//! Terminals do not agree on how a translucent pixel is blended with what is
+//! behind it. Some blend in linear light, which thins dark text on a light
+//! background until it looks gray, and some darken translucent pixels beyond
+//! both colors involved. So when the terminal reports its background color
+//! the page is blended with it here (see `doc::Doc::render`) and only opaque
+//! and fully transparent pixels are sent; real translucency is the fallback
+//! for a terminal that keeps its background to itself.
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
@@ -39,6 +48,9 @@ pub struct Theme {
     /// it is only set for PNG export and when `--theme` contradicts the
     /// terminal's real background.
     pub page: Option<Rgb>,
+    /// The color the page is seen against, if known: `page`, or else the
+    /// background the terminal reported.
+    pub behind: Option<Rgb>,
     pub fg: Rgba,
     /// Secondary text: labels, struck-through text, raw HTML.
     pub dim: Rgba,
@@ -51,16 +63,16 @@ pub struct Theme {
     pub border: Rgba,
     pub quote_bar: Rgba,
     pub table_head: Rgba,
-    /// Fill of a checked task box, and the check mark drawn on it.
+    /// Fill of a checked task box.
     pub check: Rgba,
-    pub check_mark: Rgba,
-    /// Highlight behind selected text.
-    pub select: Rgba,
-    /// The color behind the page, for covering what scrolls underneath
-    /// something that stays in place (a table header).
-    pub backdrop: Rgba,
     /// The thumb of a scroll bar.
     pub thumb: Rgba,
+    /// The background color, for what has to look like a hole in something
+    /// (the mark in a checked task box) or cover what scrolls underneath
+    /// (a table header that stays in place). A guess if it is not known.
+    pub paper: Rgb,
+    /// What selected text stands on.
+    pub select: Rgb,
 }
 
 const DARK_BG: Rgb = Rgb(0x0d, 0x11, 0x17);
@@ -95,49 +107,36 @@ impl Theme {
         Theme::with(dark, Some(bg), Some(bg), if dark { DARK_FG } else { LIGHT_FG })
     }
 
-    /// `behind` is the color the page is seen against, if known.
     fn with(dark: bool, page: Option<Rgb>, behind: Option<Rgb>, fg: Rgb) -> Theme {
-        // A tint is the text color at strength `t` over the background. With
-        // a known background it is mixed here into an opaque color, because
-        // terminals disagree on how to blend translucent pixels (kitty blends
-        // in linear light, which makes a 9% overlay look like 25%). Only when
-        // the terminal did not report its background is real alpha used.
-        let tint = |t: f32| match behind {
-            Some(bg) => bg.mix(fg, t).opaque(),
-            None => fg.alpha(t),
-        };
-        // Fills that text sits on (inline code, table headers) are half
-        // transparent, so the selection highlight underneath shows through
-        // them. Half of twice the tint looks the same as the tint itself,
-        // and - unlike a faint overlay of the text color - nearly the same
-        // however the terminal blends, because the color is close to the
-        // background.
-        let wash = |t: f32| match (page, behind) {
-            (None, Some(bg)) => bg.mix(fg, 2.0 * t).alpha(0.5),
-            _ => tint(t),
-        };
+        // The text color at strength `t` over whatever is behind.
+        let tint = |t: f32| fg.alpha(t);
         let link = if dark { Rgb(0x6c, 0xb6, 0xff) } else { Rgb(0x09, 0x69, 0xda) };
+        let paper = behind.unwrap_or(if dark { DARK_BG } else { LIGHT_BG });
         Theme {
             dark,
             page,
+            behind,
             fg: fg.opaque(),
             dim: tint(0.58),
             quote: tint(0.8),
             link: link.opaque(),
-            code_bg: wash(if dark { 0.1 } else { 0.065 }),
+            code_bg: tint(if dark { 0.1 } else { 0.06 }),
             border: tint(if dark { 0.2 } else { 0.14 }),
             quote_bar: tint(0.38),
-            table_head: wash(if dark { 0.07 } else { 0.05 }),
+            table_head: tint(if dark { 0.07 } else { 0.045 }),
             check: tint(0.34),
-            check_mark: behind.unwrap_or(if dark { DARK_BG } else { LIGHT_BG }).opaque(),
-            backdrop: behind.unwrap_or(if dark { DARK_BG } else { LIGHT_BG }).opaque(),
             thumb: tint(0.3),
-            // Drawn under the text when the page is transparent (opaque
-            // then, if the background is known); a veil over it otherwise.
-            select: match (page, behind) {
-                (None, Some(bg)) => bg.mix(link, if dark { 0.38 } else { 0.26 }).opaque(),
-                _ => link.alpha(0.3),
-            },
+            paper,
+            select: paper.mix(link, if dark { 0.38 } else { 0.26 }),
+        }
+    }
+
+    /// `color` as it looks on the page: blended with the background if that
+    /// is known, so that it does not depend on how the terminal blends.
+    pub fn solid(&self, color: Rgba) -> Rgba {
+        match self.behind {
+            Some(bg) => bg.mix(Rgb(color.0, color.1, color.2), color.3 as f32 / 255.0).opaque(),
+            None => color,
         }
     }
 }
@@ -151,11 +150,12 @@ mod tests {
         let t = Theme::new(Some(Rgb(30, 30, 46)), Some(Rgb(205, 214, 244)), None);
         assert!(t.dark);
         assert_eq!(t.page, None);
+        assert_eq!(t.behind, Some(Rgb(30, 30, 46)));
         assert_eq!(t.fg, Rgba(205, 214, 244, 255));
-        // Tints are opaque mixes of the terminal's two colors.
-        assert_eq!(t.border, Rgb(30, 30, 46).mix(Rgb(205, 214, 244), 0.2).opaque());
-        // Fills under text are half transparent and look like a 10% tint.
-        assert_eq!(t.code_bg, Rgb(30, 30, 46).mix(Rgb(205, 214, 244), 0.2).alpha(0.5));
+        // Tints are the text color at some strength; on the page they are
+        // blended with the terminal's background.
+        assert_eq!(t.border, Rgb(205, 214, 244).alpha(0.2));
+        assert_eq!(t.solid(t.border), Rgb(30, 30, 46).mix(Rgb(205, 214, 244), 0.2).opaque());
     }
 
     #[test]
@@ -173,8 +173,8 @@ mod tests {
     fn unknown_terminal_defaults_to_dark() {
         let t = Theme::new(None, None, None);
         assert!(t.dark);
-        assert_eq!(t.page, None);
-        // Unknown background: tints fall back to translucency.
-        assert_eq!(t.code_bg.3, 26);
+        assert_eq!((t.page, t.behind), (None, None));
+        // Unknown background: tints stay translucent.
+        assert_eq!(t.solid(t.code_bg).3, 26);
     }
 }

@@ -200,8 +200,8 @@ pub struct Rect {
     pub z: i32,
 }
 
-/// Draws solid rectangles (selection highlight, scroll bars, flashes) by
-/// showing crops of small one-color images. Moving or resizing a rectangle
+/// Draws solid rectangles (scroll bars, what a held table header stands on)
+/// by showing crops of small one-color images. Moving or resizing a rectangle
 /// is then a placement command of a few dozen bytes, with no pixels to
 /// render or send.
 #[derive(Default)]

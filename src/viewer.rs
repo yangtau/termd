@@ -22,6 +22,8 @@ const KEEP_TILES: u32 = 16;
 /// block of ids per table; page tiles count up from 1.
 const TABLE_ID: u32 = 0x2000_0000;
 const TABLE_IDS: u32 = 4096;
+/// Added to the id of a tile for its highlighted variant.
+const LIT_ID: u32 = 0x1000_0000;
 /// Interval between frames of a scroll animation.
 const FRAME: Duration = Duration::from_millis(8);
 /// Time constant of the scroll animation: each frame covers a fixed fraction
@@ -126,10 +128,13 @@ impl Geometry {
         (self.rows - 1) * self.cell_h
     }
 
-    /// Body font size: slightly smaller than the cell height, i.e. close to
-    /// the terminal's own font size. This also tracks HiDPI scaling.
+    /// Body font size: the height of a terminal line, which is about a
+    /// fifth more than the terminal's own font size. A page of running text
+    /// in a proportional face, a serif above all, wants to be larger than
+    /// the monospace text around it to read as well. This also tracks
+    /// HiDPI scaling.
     fn font_px(&self, zoom: f32) -> f32 {
-        (self.cell_h as f32 * 0.8 * zoom).max(6.0)
+        (self.cell_h as f32 * zoom).max(6.0)
     }
 }
 
@@ -140,18 +145,23 @@ struct Tile {
     /// 0 for the page, else the table's number (see `doc::TableBox::layer`).
     layer: u16,
     index: u32,
+    /// The same pixels on the selection color. Selected text is shown by
+    /// putting crops of this on top of the page, so that highlighting is a
+    /// matter of placements, like everything else that moves.
+    lit: bool,
 }
 
 impl Tile {
     fn page(index: u32) -> Tile {
-        Tile { layer: 0, index }
+        Tile { layer: 0, index, lit: false }
     }
 
     fn id(self) -> u32 {
-        match self.layer {
+        let id = match self.layer {
             0 => self.index + 1,
             table => TABLE_ID + (table as u32 - 1) * TABLE_IDS + self.index % TABLE_IDS,
-        }
+        };
+        if self.lit { id + LIT_ID } else { id }
     }
 }
 
@@ -178,6 +188,8 @@ struct Frame {
 /// Rows of a layer to put on the screen.
 struct Show {
     layer: u16,
+    /// From the highlighted variant of the layer's tiles.
+    lit: bool,
     /// Page rows, from and to.
     rows: (u32, u32),
     /// Screen row for the first of them; rows that end up above the
@@ -249,8 +261,8 @@ pub struct Viewer {
     /// The latest pointer position not yet looked at.
     moved: Option<(f64, f64)>,
     hover: Hover,
-    /// A page rectangle (x, y, width, height) lit up until the given time.
-    flash: Option<([f32; 4], Instant)>,
+    /// Text lit up like a selection until the given time: from, to.
+    flash: Option<((Pos, Pos), Instant)>,
     /// The code block copied last, and when.
     copied: Option<(usize, Instant)>,
     sprites: kitty::Sprites,
@@ -684,7 +696,7 @@ impl Viewer {
         let mut out = Vec::new();
         kitty::copy(&mut out, &text);
         write_all(&out)?;
-        self.flash = Some((self.doc.code_frame(code), Instant::now() + FLASH));
+        self.flash = Some((self.doc.code_span(code), Instant::now() + FLASH));
         self.copied = Some((code, Instant::now()));
         let lines = text.lines().count();
         let what = if fenced { "code block with its fences" } else { "code block" };
@@ -733,9 +745,11 @@ impl Viewer {
         let mut visible = false;
         let deadline = Instant::now() + WORK_SLICE;
         for (top, bottom) in self.doc.highlight(&mut self.engine, Some(deadline)) {
-            for tile in (top / TILE_H..=bottom.saturating_sub(1) / TILE_H).map(Tile::page) {
-                self.sent.remove(&tile);
-                visible |= self.placed.contains(&(tile, 1));
+            for index in top / TILE_H..=bottom.saturating_sub(1) / TILE_H {
+                for tile in [Tile::page(index), Tile { lit: true, ..Tile::page(index) }] {
+                    self.sent.remove(&tile);
+                    visible |= self.placed.iter().any(|(placed, _)| *placed == tile);
+                }
             }
         }
         visible
@@ -911,7 +925,8 @@ impl Viewer {
         let area = self.area(tile).unwrap_or(Area { x: 0, y: 0, w: 0, h: 0 });
         self.sent.insert(tile, area);
         if area.h > 0 {
-            let pixels = self.doc.render(&mut self.engine, tile.layer, area.x, area.y, area.w, area.h);
+            let (layer, lit) = (tile.layer, tile.lit);
+            let pixels = self.doc.render(&mut self.engine, layer, area.x, area.y, area.w, area.h, lit);
             self.uploader.transmit(out, tile.id(), area.w, area.h, &pixels);
         }
         area
@@ -935,7 +950,7 @@ impl Viewer {
             return;
         }
         for index in (from - top) / TILE_H..=(to - 1 - top) / TILE_H {
-            let tile = Tile { layer: show.layer, index };
+            let tile = Tile { layer: show.layer, index, lit: show.lit };
             let area = match self.sent.get(&tile) {
                 Some(area) => *area,
                 None if frame.rendered && !self.placed.contains(&(tile, show.placement)) => {
@@ -1025,13 +1040,25 @@ impl Viewer {
 
         // The page, then the sideways scrolling tables that sit in it, each
         // cropped to how far it is scrolled.
-        self.show(&mut frame, &Show { layer: 0, rows: (scroll, view_end), at: 0, crop: None, placement: 1, z: 0 });
+        let page = Show { layer: 0, lit: false, rows: (scroll, view_end), at: 0, crop: None, placement: 1, z: 0 };
+        self.show(&mut frame, &page);
         let tables: Vec<TableBox> = self.scrolling_tables(scroll).map(|(_, t)| *t).collect();
         for t in &tables {
             let rows = ((t.y.floor() as u32).max(scroll), ((t.y + t.h).ceil() as u32).min(view_end));
             let crop = Some(((t.x + t.scroll) as u32, t.w as u32, t.x as u32));
             let at = rows.0 as i64 - scroll as i64;
-            self.show(&mut frame, &Show { layer: t.layer, rows, at, crop, placement: 1, z: 0 });
+            self.show(&mut frame, &Show { layer: t.layer, lit: false, rows, at, crop, placement: 1, z: 0 });
+        }
+        // What is highlighted (the selection, something just copied): the
+        // same place again from the tiles' highlighted variant, on top.
+        for (n, (layer, area)) in self.highlights(scroll).into_iter().enumerate() {
+            let [x, y, w, h] = area.map(|v| v.round().max(0.0) as u32);
+            let rows = (y.max(scroll), (y + h).min(view_end));
+            // A sideways scrolled table shows a later part of itself.
+            let shift = layer.checked_sub(1).and_then(|t| self.doc.tables().get(t as usize)).map_or(0.0, |t| t.scroll);
+            let crop = Some((x + shift as u32, w, x));
+            let at = rows.0 as i64 - scroll as i64;
+            self.show(&mut frame, &Show { layer, lit: true, rows, at, crop, placement: n as u32 + 1, z: 1 });
         }
         // Headers held at the top: the same pixels, placed a second time
         // above everything else.
@@ -1039,7 +1066,7 @@ impl Viewer {
         for (t, at) in &held {
             let rows = (t.y.floor() as u32, (t.y + t.head_h).ceil() as u32);
             let crop = Some(((t.x + t.scroll) as u32, t.w as u32, t.x as u32));
-            self.show(&mut frame, &Show { layer: t.layer, rows, at: *at, crop, placement: 2, z: 2 });
+            self.show(&mut frame, &Show { layer: t.layer, lit: false, rows, at: *at, crop, placement: 2, z: 3 });
         }
 
         for &(tile, placement) in self.placed.difference(&frame.placed) {
@@ -1077,27 +1104,24 @@ impl Viewer {
         write_all(&frame.out)
     }
 
-    /// The solid rectangles to show on top of or underneath the page, for
-    /// the viewport starting at page offset `scroll`.
+    /// The parts of the page to show highlighted in the viewport starting
+    /// at page offset `scroll`, as (layer, [x, y, width, height]): the
+    /// selection, and what was copied a moment ago.
+    fn highlights(&self, scroll: u32) -> Vec<(u16, [f32; 4])> {
+        let (top, bottom) = (scroll as f32, (scroll + self.geom.view_h()) as f32);
+        let spans = self.flash.map(|(span, _)| span).into_iter().chain(self.selected());
+        spans.flat_map(|(from, to)| self.doc.selection_rects(from, to, top, bottom)).collect()
+    }
+
+    /// The solid rectangles to show on top of the page, for the viewport
+    /// starting at page offset `scroll`.
     fn overlay(&self, scroll: u32, tables: &[TableBox], held: &[(TableBox, i64)]) -> Vec<kitty::Rect> {
-        // Highlights go under the text where the page lets them show
-        // through, and over it as a veil where it has its own background.
-        let z = if self.theme.page.is_some() { 1 } else { -1 };
         let mut rects = Vec::new();
-        if let Some((area, _)) = self.flash {
-            rects.extend(self.screen_rect(area, scroll, self.theme.select, z));
-        }
-        if let Some((from, to)) = self.selected() {
-            let (top, bottom) = (scroll as f32, (scroll + self.geom.view_h()) as f32);
-            for area in self.doc.selection_rects(from, to, top, bottom) {
-                rects.extend(self.screen_rect(area, scroll, self.theme.select, z));
-            }
-        }
         // What scrolls underneath a held header must not show through it.
         for (t, at) in held {
             let top = scroll as f32 + (*at).max(0) as f32;
             let height = t.head_h + (*at).min(0) as f32;
-            rects.extend(self.screen_rect([t.x, top, t.w, height], scroll, self.theme.backdrop, 1));
+            rects.extend(self.screen_rect([t.x, top, t.w, height], scroll, self.theme.paper.opaque(), 2));
         }
         // A scroll bar along the bottom of a sideways scrolling table, or
         // along the bottom of the viewport while the table goes on below.
@@ -1106,7 +1130,8 @@ impl Viewer {
             let bottom = (t.y + t.h).min((scroll + self.geom.view_h()) as f32) - 2.0 * thick;
             let length = (t.w * t.w / t.full_w).max(4.0 * thick);
             let x = t.x + (t.w - length) * t.scroll / (t.full_w - t.w).max(1.0);
-            rects.extend(self.screen_rect([x, bottom, length, thick], scroll, self.theme.thumb, 3));
+            let thumb = self.theme.solid(self.theme.thumb);
+            rects.extend(self.screen_rect([x, bottom, length, thick], scroll, thumb, 4));
         }
         rects
     }
