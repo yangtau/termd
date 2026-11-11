@@ -2371,11 +2371,13 @@ Last &amp; final paragraph.
     #[test]
     fn selection_highlight_follows_the_lines() {
         let Some(mut eng) = engine() else { return };
-        let doc = layout(&mut eng, SAMPLE, 200);
+        // So narrow that the text column is at its minimum (4 em, less than
+        // the longest word), whatever font the machine has: the paragraph
+        // breaks into well over three lines.
+        let doc = layout(&mut eng, SAMPLE, 100);
         let (from, to) = (before(&doc, "First"), before(&doc, "item one"));
         let rects = doc.selection_rects(from, to, 0.0, doc.height() as f32);
-        // The paragraph wraps at this width: one rectangle per line, each
-        // right under the one before.
+        // One rectangle per line, each right under the one before.
         assert!(rects.len() >= 3, "{rects:?}");
         for pair in rects.windows(2) {
             assert!(pair[1][1] >= pair[0][1] + pair[0][3] - 0.5, "{pair:?}");
