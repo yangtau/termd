@@ -1,7 +1,7 @@
 {
-  "latest": null,
+  "latest": "0.1.0",
   "versions": {
-    "main": {
+    "0.1.0": {
       "aarch64-darwin": {
         "target": "aarch64-apple-darwin",
         "hash": "sha256-RxmyjMT4i6pu8ZZLg5L3PVWMt4p6fkz7a4ChFf3WXMU="

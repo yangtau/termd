@@ -126,7 +126,7 @@ jobs:
       - name: Record version and hashes
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           # 二进制文件的 target -> nix system
           declare -A systems=(
             [x86_64-unknown-linux-musl]=x86_64-linux
