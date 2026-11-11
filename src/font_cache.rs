@@ -17,6 +17,7 @@
 //! F <index> <weight> <style> <stretch> <mono> <path> <postscript> <family>...
 //! ```
 
+use crate::fonts::Index;
 use cosmic_text::fontdb::{Database, FaceInfo, ID, Language, Source, Stretch, Style, Weight};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -24,13 +25,6 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 const HEADER: &str = "termd-fonts 2";
-
-/// A font index: every installed face, and the system's default families
-/// (sans, monospace, CJK sans, serif, CJK serif) where there is a way to ask.
-pub struct Index {
-    pub db: Database,
-    pub defaults: [Option<String>; 5],
-}
 
 fn cache_file() -> Option<PathBuf> {
     let home = || std::env::var_os("HOME").map(PathBuf::from);

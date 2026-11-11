@@ -1,8 +1,14 @@
 //! termd — preview Markdown in the terminal as a rendered, scrollable page,
 //! using the Kitty graphics protocol.
 
+#[cfg(target_os = "macos")]
+mod coretext;
 mod doc;
 mod editor;
+// The index of installed fonts is not needed where the system has one to
+// ask (see `fonts`); its tests run everywhere.
+#[cfg(any(test, not(target_os = "macos")))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod font_cache;
 mod fonts;
 mod highlight;
@@ -96,14 +102,20 @@ impl Trace {
     pub fn note(&mut self, what: impl std::fmt::Display) {
         self.notes.push(format!("{:>7.1}ms  {what}", self.start.elapsed().as_secs_f64() * 1e3));
     }
+
+    fn print(&self) {
+        if std::env::var_os("TERMD_DEBUG").is_some() {
+            eprintln!("{}", self.notes.join("\n"));
+        }
+    }
 }
 
 fn main() -> Result<()> {
     let mut trace = Trace { start: Instant::now(), notes: Vec::new() };
     let cli = Cli::parse();
-    // Indexing the installed fonts is the slowest part of starting up when
-    // it is not cached, so it runs while the file is read and the terminal
-    // is probed.
+    // Where the installed fonts have to be indexed, that is the slowest part
+    // of starting up when it is not cached, so it runs while the file is
+    // read and the terminal is probed.
     let scan = std::thread::spawn(fonts::scan);
     let source = read_source(&cli.file)?;
     // Likewise syntax highlighting, which has its own thread.
@@ -111,9 +123,7 @@ fn main() -> Result<()> {
     doc::prepare_highlighting(&mut highlighter, &source);
     let engine = |trace: &mut Trace| -> Result<Engine> {
         let installed = scan.join().map_err(|_| anyhow!("scanning the installed fonts failed"))?;
-        let took = installed.took.as_secs_f64() * 1e3;
-        let how = if installed.cached { "read from cache" } else { "scanned" };
-        trace.note(format!("font index joined: {} faces, {how} in {took:.1}ms", installed.faces()));
+        trace.note(&installed.how);
         let choice = fonts::Choice { body: cli.font.as_deref(), mono: cli.mono_font.as_deref(), sans: cli.sans };
         let engine = Engine::new(installed, highlighter, &choice);
         trace.note(format!("fonts ready: {}", engine.font_names()));
@@ -132,7 +142,9 @@ fn main() -> Result<()> {
             scroll_tables: false,
         };
         let page = Doc::new(&mut engine, &source, opts).render_page(&mut engine).context("page too large to export")?;
+        trace.note("page rendered");
         page.save(out).with_context(|| format!("writing {}", out.display()))?;
+        trace.print();
         return Ok(());
     }
 
@@ -158,9 +170,7 @@ fn main() -> Result<()> {
         viewer.run()
     });
     drop(guard);
-    if std::env::var_os("TERMD_DEBUG").is_some() {
-        eprintln!("{}", trace.notes.join("\n"));
-    }
+    trace.print();
     result
 }
 

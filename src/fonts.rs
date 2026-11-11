@@ -6,19 +6,23 @@
 //! whichever installed fonts happen to be bold. It is also slow, because every
 //! distinct text style makes it reopen every installed font file.
 //!
-//! So termd picks the families itself. The system is scanned once (metadata
-//! only), and the `FontSystem` is given a small database holding just the
-//! chosen Latin, monospace and CJK families. Each text run is then assigned a
-//! family and a weight that family really has (see `Family::weight`). Other
-//! families are copied in only when the document contains characters the
-//! chosen ones cannot draw. The scan result is cached on disk (`font_cache`).
+//! So termd picks the families itself, and the `FontSystem` is given a small
+//! database holding just the chosen Latin, monospace and CJK families. Each
+//! text run is then assigned a family and a weight that family really has
+//! (see `Family::weight`). Other families are added only when the document
+//! contains characters the chosen ones cannot draw.
+//!
+//! That takes a handful of font files out of the hundreds a machine has.
+//! Where they are is a question for the system's own font index: on macOS
+//! Core Text is asked for each family, and for a font for each character
+//! that is missing, so nothing has to be scanned (`coretext`). Elsewhere
+//! there is no such service to link against; there the installed fonts are
+//! indexed once (metadata only) and the index is kept on disk (`font_cache`).
 
-use crate::font_cache::{self, Index};
-use cosmic_text::fontdb::{Database, FaceInfo, Style};
+use cosmic_text::fontdb::{Database, FaceInfo, Source, Style};
 use cosmic_text::skrifa::{FontRef, MetadataProvider, Tag};
 use cosmic_text::{FontSystem, PlatformFallback};
 use std::collections::HashSet;
-use std::process::Stdio;
 
 const SANS: &[&str] = &[
     // macOS: the system UI font, then the classic fallbacks.
@@ -139,6 +143,7 @@ const SERIF_KO: &[&str] =
     &["AppleMyungjo", "Source Han Serif K", "Noto Serif CJK KR", "Noto Serif KR", "NanumMyeongjo"];
 
 /// Tried first, in this order, for characters the main families lack.
+#[cfg(not(target_os = "macos"))]
 const EXTRA: &[&str] = &[
     "Apple Color Emoji",
     "Noto Color Emoji",
@@ -209,7 +214,8 @@ pub struct Fonts {
     /// CJK companion of `ui`, also used inside code.
     ui_cjk: Option<Family>,
     mono: Family,
-    /// Every installed face; only metadata, the files are not kept open.
+    /// The faces known so far (all that are installed, where they were
+    /// indexed); only metadata, the files are not kept open.
     all: Database,
     /// Families already copied into the `FontSystem`.
     loaded: Vec<String>,
@@ -217,46 +223,70 @@ pub struct Fonts {
     checked: HashSet<char>,
 }
 
-/// What `scan` found on this machine.
+/// A font index: faces by family, and the system's default families (sans,
+/// monospace, CJK sans, serif, CJK serif) where there is a way to ask.
+pub struct Index {
+    pub db: Database,
+    pub defaults: [Option<String>; 5],
+}
+
+/// What is known about the installed fonts when termd starts.
 pub struct Installed {
     index: Index,
-    /// How long it took and whether it came from the cache, for `TERMD_DEBUG`.
-    pub took: std::time::Duration,
-    pub cached: bool,
+    /// Where that comes from and how long it took, for `TERMD_DEBUG`.
+    pub how: String,
 }
 
-impl Installed {
-    pub fn faces(&self) -> usize {
-        self.index.db.len()
+/// Find out what fonts there are, as far as that has to be known up front.
+///
+/// On macOS the system is asked when a font is needed. That is quick, but
+/// the first questions take a few milliseconds, so the ones with a known
+/// answer (the families the defaults are chosen from) are asked here, on
+/// the thread `main` runs this on while the terminal is being probed.
+#[cfg(target_os = "macos")]
+pub fn scan() -> Installed {
+    let start = std::time::Instant::now();
+    let mut db = Database::new();
+    for list in [SANS, MONO, SERIF, &cjk_candidates(false), &cjk_candidates(true)] {
+        first_installed(&mut db, [], list);
     }
+    let how = format!("default fonts found in {:.1}ms", start.elapsed().as_secs_f64() * 1e3);
+    Installed { index: Index { db, defaults: [const { None }; 5] }, how }
 }
 
-/// Index the installed fonts, from the cache if nothing has changed since
-/// it was written. A real scan is slow (hundreds of milliseconds with many
-/// fonts, seconds after a reboot), so `main` runs this on a thread while the
-/// terminal is being probed.
+/// Find out what fonts there are, as far as that has to be known up front.
+///
+/// Here that is all of them: they are indexed, from the cache if nothing
+/// has changed since it was written. A real scan is slow (hundreds of
+/// milliseconds with many fonts, seconds after a reboot), so `main` runs
+/// this on a thread while the terminal is being probed.
+#[cfg(not(target_os = "macos"))]
 pub fn scan() -> Installed {
     let start = std::time::Instant::now();
     let lang = cjk_lang().lang;
-    if let Some(index) = font_cache::load(lang) {
-        return Installed { index, took: start.elapsed(), cached: true };
-    }
-    let index = index(lang);
-    font_cache::store(&index, lang);
-    Installed { index, took: start.elapsed(), cached: false }
+    let (index, how) = match crate::font_cache::load(lang) {
+        Some(index) => (index, "read from cache"),
+        None => {
+            let index = index(lang);
+            crate::font_cache::store(&index, lang);
+            (index, "scanned")
+        }
+    };
+    let took = start.elapsed().as_secs_f64() * 1e3;
+    let how = format!("font index: {} faces, {how} in {took:.1}ms", index.db.len());
+    Installed { index, how }
 }
 
 /// Really index the installed fonts.
+#[cfg(not(target_os = "macos"))]
 fn index(lang: &str) -> Index {
-    // On Linux and the BSDs fontconfig knows which fonts the user prefers.
-    // The three questions run as concurrent processes while we scan.
+    use std::process::Stdio;
+    // fontconfig knows which fonts the user prefers. The questions run as
+    // concurrent processes while we scan.
     let (cjk_sans, cjk_serif) = (format!("sans-serif:lang={lang}"), format!("serif:lang={lang}"));
     // The Latin ones are asked for English text: they are used for non-CJK runs.
     let patterns = ["sans-serif:lang=en", "monospace:lang=en", &cjk_sans, "serif:lang=en", &cjk_serif];
     let asked = patterns.map(|pattern| {
-        if cfg!(target_os = "macos") {
-            return None;
-        }
         std::process::Command::new("fc-match")
             .args(["-f", "%{family[0]}", pattern])
             .stdin(Stdio::null())
@@ -268,16 +298,6 @@ fn index(lang: &str) -> Index {
 
     let mut db = Database::new();
     db.load_system_fonts();
-    // Since macOS 15 PingFang is no longer in /System/Library/Fonts.
-    #[cfg(target_os = "macos")]
-    for dir in [
-        "/System/Library/PrivateFrameworks/FontServices.framework/Resources/Reserved",
-        "/System/Library/PrivateFrameworks/FontServices.framework/Versions/A/Resources/Reserved",
-    ] {
-        if !db.faces().any(|f| has_name(f, "PingFang SC")) {
-            db.load_fonts_dir(dir);
-        }
-    }
     let defaults = asked.map(|child| {
         let out = child?.wait_with_output().ok()?;
         let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
@@ -286,12 +306,85 @@ fn index(lang: &str) -> Index {
     Index { db, defaults }
 }
 
-/// The installed fonts, for tests: not from the cache, and `None` where
-/// there are none (a build sandbox), in which case text cannot be laid out.
+/// What `scan` gives, for tests: not from the cache, and `None` where there
+/// are no fonts (a build sandbox), in which case text cannot be laid out.
 #[cfg(test)]
 pub fn installed_for_tests() -> Option<Installed> {
-    let index = index(cjk_lang().lang);
-    (!index.db.is_empty()).then(|| Installed { index, took: std::time::Duration::ZERO, cached: false })
+    #[cfg(target_os = "macos")]
+    return Some(scan());
+    #[cfg(not(target_os = "macos"))]
+    {
+        let index = index(cjk_lang().lang);
+        (!index.db.is_empty()).then(|| Installed { index, how: String::new() })
+    }
+}
+
+/// Fonts of macOS that have no public family name, and their files in
+/// /System/Library/Fonts.
+#[cfg(target_os = "macos")]
+const SYSTEM_FILES: &[(&str, &[&str])] = &[
+    (".SF NS", &["SFNS.ttf", "SFNSItalic.ttf"]),
+    (".SF NS Mono", &["SFNSMono.ttf", "SFNSMonoItalic.ttf"]),
+    (".New York", &["NewYork.ttf", "NewYorkItalic.ttf"]),
+];
+
+/// Make the family called `name` known to `all`, if it is installed.
+#[cfg(target_os = "macos")]
+fn locate(all: &mut Database, name: &str) {
+    if all.faces().any(|f| has_name(f, name)) {
+        return;
+    }
+    let files = match SYSTEM_FILES.iter().find(|(family, _)| family.eq_ignore_ascii_case(name)) {
+        Some((_, files)) => files.iter().map(|file| std::path::Path::new("/System/Library/Fonts").join(file)).collect(),
+        None => crate::coretext::family_files(name),
+    };
+    load_files(all, &files);
+}
+
+/// Make the family called `name` known to `all`, if it is installed. (It
+/// is already: everything installed has been indexed.)
+#[cfg(not(target_os = "macos"))]
+fn locate(_all: &mut Database, _name: &str) {}
+
+/// Add the faces of `files` to `all`, unless they are there already.
+#[cfg(target_os = "macos")]
+fn load_files(all: &mut Database, files: &[std::path::PathBuf]) {
+    for file in files {
+        if !all.faces().any(|f| file_of(f) == Some(file)) {
+            let _ = all.load_font_file(file);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn file_of(face: &FaceInfo) -> Option<&std::path::PathBuf> {
+    match &face.source {
+        Source::File(file) | Source::SharedFile(file, _) => Some(file),
+        Source::Binary(_) => None,
+    }
+}
+
+/// Families worth trying for `missing`, characters that none of the
+/// families in use can draw, best first: those of the fonts the system
+/// would take for them next to the family `base`.
+#[cfg(target_os = "macos")]
+fn substitutes(all: &mut Database, base: &str, missing: &[char]) -> Vec<String> {
+    let files = crate::coretext::files_for(base, missing);
+    load_files(all, &files);
+    let family = |f: &FaceInfo| f.families.first().map(|(name, _)| name.clone());
+    files.iter().flat_map(|file| all.faces().filter(move |f| file_of(f) == Some(file)).filter_map(family)).collect()
+}
+
+/// Families worth trying for `missing`, characters that none of the
+/// families in use can draw, best first: some known for emoji and symbols,
+/// then everything else that is installed.
+#[cfg(not(target_os = "macos"))]
+fn substitutes(all: &mut Database, _base: &str, _missing: &[char]) -> Vec<String> {
+    let mut names: Vec<String> = EXTRA.iter().chain(&cjk_candidates(false)).map(|s| s.to_string()).collect();
+    let mut rest: Vec<&FaceInfo> = all.faces().collect();
+    rest.sort_by_key(|f| (f.style != Style::Normal, f.weight.0.abs_diff(400), f.monospaced));
+    names.extend(rest.iter().filter_map(|f| f.families.first()).map(|(n, _)| n.clone()));
+    names
 }
 
 fn has_name(face: &FaceInfo, name: &str) -> bool {
@@ -302,6 +395,8 @@ fn has_name(face: &FaceInfo, name: &str) -> bool {
 struct Cjk {
     sans: &'static [&'static str],
     serif: &'static [&'static str],
+    /// Not needed where fontconfig is not asked.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     lang: &'static str,
 }
 
@@ -353,44 +448,42 @@ fn cjk_candidates(serif: bool) -> Vec<&'static str> {
 impl Fonts {
     /// Choose the families and build a `FontSystem` that knows only them.
     pub fn new(installed: Installed, choice: &Choice) -> (FontSystem, Fonts) {
-        let Index { db: all, defaults: [fc_sans, fc_mono, fc_cjk, fc_serif, fc_cjk_serif] } = installed.index;
-        // Explicit choice, then the system's configured default, then the
-        // first installed family of our own list.
-        let pick = |explicit: Option<&str>, configured: &Option<String>, list: &[&str]| {
-            explicit
-                .into_iter()
-                .chain(configured.as_deref())
-                .chain(list.iter().copied())
-                .find_map(|name| family(&all, name))
-        };
-        let unknown = |name: &str| Family { name: name.into(), weights: vec![], variable: None };
+        let Index { db: mut all, defaults: [fc_sans, fc_mono, fc_cjk, fc_serif, fc_cjk_serif] } = installed.index;
         // fontconfig answers with its default font when nothing supports the
         // language, so its CJK answers only count if the font has Han glyphs.
-        let has_han = |name: &String| {
+        let has_han = |all: &Database, name: &String| {
             let mut probe = vec!['中'];
-            uncovered(&all, name, &mut probe);
+            uncovered(all, name, &mut probe);
             probe.is_empty()
         };
+        let (fc_cjk, fc_cjk_serif) = (fc_cjk.filter(|n| has_han(&all, n)), fc_cjk_serif.filter(|n| has_han(&all, n)));
 
-        let ui = pick(None, &fc_sans, SANS)
-            .or_else(|| any_family(&all, false))
-            .unwrap_or_else(|| unknown("sans-serif"));
-        let ui_cjk = pick(None, &fc_cjk.filter(has_han), &cjk_candidates(false));
-        let mono = pick(choice.mono, &fc_mono, MONO)
-            .or_else(|| any_family(&all, true))
-            .unwrap_or_else(|| unknown("monospace"));
+        // An explicit choice, then the system's configured default, then
+        // the first installed family of our own list.
+        let all = &mut all;
+        let ui = first_installed(all, [fc_sans.as_deref()], SANS);
+        let ui_cjk = first_installed(all, [fc_cjk.as_deref()], &cjk_candidates(false));
+        let mono = first_installed(all, [choice.mono, fc_mono.as_deref()], MONO);
+        let chosen = first_installed(all, [choice.body], &[]);
         let (serif, serif_cjk) = match choice.sans {
             true => (None, None),
-            false => (pick(None, &fc_serif, SERIF), pick(None, &fc_cjk_serif.filter(has_han), &cjk_candidates(true))),
+            false => (
+                first_installed(all, [fc_serif.as_deref()], SERIF),
+                first_installed(all, [fc_cjk_serif.as_deref()], &cjk_candidates(true)),
+            ),
         };
-        let body = choice.body.and_then(|name| family(&all, name)).or(serif).unwrap_or_else(|| ui.clone());
+
+        let unknown = |name: &str| Family { name: name.into(), weights: vec![], variable: None };
+        let ui = ui.or_else(|| any_family(all, false)).unwrap_or_else(|| unknown("sans-serif"));
+        let mono = mono.or_else(|| any_family(all, true)).unwrap_or_else(|| unknown("monospace"));
+        let body = chosen.or(serif).unwrap_or_else(|| ui.clone());
         let body_cjk = serif_cjk.or_else(|| ui_cjk.clone());
 
         let mut db = Database::new();
         let mut loaded = Vec::new();
         for fam in [Some(&body), body_cjk.as_ref(), Some(&ui), ui_cjk.as_ref(), Some(&mono)].into_iter().flatten() {
             if !loaded.contains(&fam.name) {
-                copy_family(&all, &mut db, &fam.name, &mut loaded);
+                copy_family(all, &mut db, &fam.name, &mut loaded);
             }
         }
         db.set_sans_serif_family(ui.name.clone());
@@ -399,6 +492,7 @@ impl Fonts {
 
         let locale = "en-US".to_string(); // only used by cosmic-text's own fallback lists
         let fs = FontSystem::new_with_locale_and_db_and_fallback(locale, db, PlatformFallback);
+        let all = std::mem::take(all);
         (fs, Fonts { body, body_cjk, ui, ui_cjk, mono, all, loaded, checked: HashSet::new() })
     }
 
@@ -447,11 +541,7 @@ impl Fonts {
             return;
         }
 
-        // Preferred extras first, then everything else that is installed.
-        let mut names: Vec<String> = EXTRA.iter().chain(&cjk_candidates(false)).map(|s| s.to_string()).collect();
-        let mut rest: Vec<&FaceInfo> = self.all.faces().collect();
-        rest.sort_by_key(|f| (f.style != Style::Normal, f.weight.0.abs_diff(400), f.monospaced));
-        names.extend(rest.iter().filter_map(|f| f.families.first()).map(|(n, _)| n.clone()));
+        let names = substitutes(&mut self.all, &self.body.name, &missing);
 
         let mut seen = HashSet::new();
         let mut added = Vec::new();
@@ -477,7 +567,16 @@ impl Fonts {
     }
 }
 
-/// Describe the family called `name`, if it is installed.
+/// The first installed family among `preferred` (those that are given) and
+/// then `list`.
+fn first_installed<const N: usize>(all: &mut Database, preferred: [Option<&str>; N], list: &[&str]) -> Option<Family> {
+    preferred.into_iter().flatten().chain(list.iter().copied()).find_map(|name| {
+        locate(all, name);
+        family(all, name)
+    })
+}
+
+/// Describe the family called `name`, if it is known.
 fn family(all: &Database, name: &str) -> Option<Family> {
     let faces: Vec<&FaceInfo> = all.faces().filter(|f| has_name(f, name)).collect();
     let first = faces.first()?;
