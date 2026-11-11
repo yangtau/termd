@@ -1,0 +1,43 @@
+name: Nix
+
+# 在 Linux x86_64 和 macOS arm64 上构建 flake，并把结果推送到 termd.cachix.org。
+# Nix 的构建结果只取决于源码，所以 main 上构建过的提交，之后打的标签也能直接命中缓存。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.system }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            system: x86_64-linux
+          - os: macos-latest # Apple Silicon
+            system: aarch64-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+
+      - uses: cachix/cachix-action@v16
+        with:
+          name: termd
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          # 只推送 termd 本身，不推送 nixpkgs 里本来就能从 cache.nixos.org 下载的依赖
+          pushFilter: '(-source$|\.tar\.gz$|-vendor-staging$|cargo-vendor-dir$)'
+
+      - name: Build
+        run: nix build -L --print-out-paths .#termd
+
+      - name: Smoke test
+        run: ./result/bin/termd --version
+
+      - name: Dev shell
+        run: nix develop --command cargo --version

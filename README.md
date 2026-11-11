@@ -13,23 +13,29 @@ cargo install --path .
 termd README.md
 ```
 
-也可以从 [Releases](https://github.com/yangtau/termd/releases) 下载预编译二进制（macOS arm64、Linux x86_64 静态链接），
-或者用 Nix：
+也可以用 Nix。CI 会把 Linux x86_64 和 macOS arm64 的构建结果推送到
+[termd.cachix.org](https://termd.cachix.org)，所以通常是直接下载，不需要本地编译：
 
 ```sh
-nix run github:yangtau/termd -- README.md           # 最新版本
-nix run github:yangtau/termd#v0_1_0 -- README.md    # 指定版本（0.1.0 → v0_1_0）
-nix profile install github:yangtau/termd#v0_1_0
+nix run github:yangtau/termd -- README.md            # main 上的最新版本
+nix run github:yangtau/termd/v0.2.0 -- README.md     # 指定版本（git 标签）
+nix profile install github:yangtau/termd/v0.2.0
+```
+
+flake 里已经声明了缓存地址和公钥（`nixConfig`），第一次使用时 Nix 会询问是否信任，
+也可以加 `--accept-flake-config`。如果你的用户不在 Nix 的 `trusted-users` 里，
+需要把缓存加到系统的 `nix.conf`：
+
+```
+extra-substituters = https://termd.cachix.org
+extra-trusted-public-keys = termd.cachix.org-1:oAIvUJ+LNA+th44rHngB2vdqz6fcDzUdDCl6W6uXGHA=
 ```
 
 在自己的 flake 里使用：
 
 ```nix
-inputs.termd.url = "github:yangtau/termd";
-# 最新版本
+inputs.termd.url = "github:yangtau/termd/v0.2.0";   # 不写标签就是 main
 environment.systemPackages = [ inputs.termd.packages.${pkgs.system}.default ];
-# 指定版本
-environment.systemPackages = [ (inputs.termd.lib.mkTermd pkgs "0.1.0") ];
 # 或者 overlay：nixpkgs.overlays = [ inputs.termd.overlays.default ]; 之后用 pkgs.termd
 ```
 
@@ -70,17 +76,17 @@ environment.systemPackages = [ (inputs.termd.lib.mkTermd pkgs "0.1.0") ];
 
 字号取自终端字符格的像素高度，因此在 HiDPI 屏幕上会自动保持清晰。
 
-## 发布
+## 开发与发布
 
-先把 `Cargo.toml` 里的 `version` 改成新版本并提交，然后打同名标签推送：
+`nix develop` 进入带 Rust 工具链的开发环境。
+
+`.github/workflows/nix.yml` 在每次推送到 main、推送 `v*` 标签和 PR 时，在 Linux x86_64 和
+macOS arm64 上执行 `nix build`，并把结果推送到 Cachix（需要仓库 secret `CACHIX_AUTH_TOKEN`）。
+
+发布新版本：改 `Cargo.toml` 里的 `version`，提交到 main，然后打同名标签：
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.2.0 && git push origin v0.2.0
 ```
 
-也可以不打标签，直接在 GitHub 的 Actions → Release → Run workflow 里填写版本号（如 `0.1.0`），
-工作流会在所选分支的最新提交上创建 `v0.1.0` 标签和 Release。
-
-`.github/workflows/release.yml` 会构建 `aarch64-apple-darwin` 和 `x86_64-unknown-linux-musl`
-两个二进制，上传到对应的 GitHub Release（附 `SHA256SUMS`），再把各平台的哈希写进默认分支的
-`nix/releases.json`。flake 就是根据这个文件下载对应版本的 release 的。
+Nix 的构建结果只取决于源码，所以标签指向的提交只要在 main 上构建过，就已经在缓存里了。

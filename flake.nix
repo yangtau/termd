@@ -1,6 +1,12 @@
 {
   description = "termd: preview Markdown in the terminal as a rendered page (Kitty graphics protocol)";
 
+  # CI 构建后推送到 Cachix，用户直接下载构建结果，不需要本地编译。
+  nixConfig = {
+    extra-substituters = [ "https://termd.cachix.org" ];
+    extra-trusted-public-keys = [ "termd.cachix.org-1:oAIvUJ+LNA+th44rHngB2vdqz6fcDzUdDCl6W6uXGHA=" ];
+  };
+
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
@@ -8,78 +14,61 @@
     let
       inherit (nixpkgs) lib;
 
-      # 由 .github/workflows/release.yml 在每次发布后自动更新
-      releases = lib.importJSON ./nix/releases.json;
-
       systems = [
         "x86_64-linux"
+        "aarch64-linux"
         "aarch64-darwin"
       ];
 
       forAllSystems = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
-      # 下载并安装指定版本的预编译二进制。
-      #   mkTermd pkgs "0.1.0"
-      mkTermd =
-        pkgs: version:
-        let
-          system = pkgs.stdenv.hostPlatform.system;
-          release =
-            releases.versions.${version}
-              or (throw "termd: unknown version ${version}; known: ${lib.concatStringsSep ", " (lib.attrNames releases.versions)}");
-          asset = release.${system} or (throw "termd ${version}: no prebuilt binary for ${system}");
-        in
-        pkgs.stdenvNoCC.mkDerivation {
+      cargoToml = lib.importTOML ./Cargo.toml;
+
+      termdPackage =
+        { lib, rustPlatform }:
+        rustPlatform.buildRustPackage {
           pname = "termd";
-          inherit version;
+          inherit (cargoToml.package) version;
 
-          src = pkgs.fetchurl {
-            url = "https://github.com/yangtau/termd/releases/download/v${version}/termd-v${version}-${asset.target}.tar.gz";
-            inherit (asset) hash;
+          # 只取构建需要的文件，改 README 等不会导致重新构建 / 缓存失效
+          src = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./src
+            ];
           };
-          sourceRoot = ".";
 
-          dontConfigure = true;
-          dontBuild = true;
-          installPhase = ''
-            runHook preInstall
-            install -Dm755 termd $out/bin/termd
-            runHook postInstall
-          '';
+          cargoLock.lockFile = ./Cargo.lock;
 
           meta = {
             description = "Preview Markdown in the terminal as a rendered page (Kitty graphics protocol)";
             homepage = "https://github.com/yangtau/termd";
             mainProgram = "termd";
             platforms = systems;
-            sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
           };
         };
-
-      # "0.1.0" -> "v0_1_0"，用作 flake 属性名：nix run github:yangtau/termd#v0_1_0
-      attrName = version: "v" + lib.replaceStrings [ "." ] [ "_" ] version;
     in
     {
-      lib = {
-        inherit mkTermd releases;
-      };
-
-      packages = forAllSystems (
-        pkgs:
-        let
-          system = pkgs.stdenv.hostPlatform.system;
-          available = lib.filterAttrs (_: r: r ? ${system}) releases.versions;
-          versioned = lib.mapAttrs' (v: _: lib.nameValuePair (attrName v) (mkTermd pkgs v)) available;
-        in
-        versioned
-        // lib.optionalAttrs (releases.latest != null && available ? ${releases.latest}) rec {
-          termd = mkTermd pkgs releases.latest;
-          default = termd;
-        }
-      );
+      packages = forAllSystems (pkgs: rec {
+        termd = pkgs.callPackage termdPackage { };
+        default = termd;
+      });
 
       overlays.default = final: _prev: {
-        termd = mkTermd final releases.latest;
+        termd = final.callPackage termdPackage { };
       };
+
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.termd ];
+          packages = [
+            pkgs.clippy
+            pkgs.rustfmt
+            pkgs.rust-analyzer
+          ];
+        };
+      });
     };
 }
