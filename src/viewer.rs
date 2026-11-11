@@ -3,13 +3,15 @@
 
 use crate::doc::{Doc, Engine, LayoutOpts};
 use crate::theme::Theme;
-use crate::{Cli, Trace, base_dir, kitty, modified, read_source};
+use crate::term::Probe;
+use crate::{Cli, Trace, base_dir, kitty, modified, open, read_source};
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::{cursor, execute, terminal};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 /// The page is uploaded to the terminal in horizontal tiles of this height.
@@ -25,6 +27,12 @@ const SCROLL_TAU: f64 = 0.05;
 const IDLE: Duration = Duration::from_millis(300);
 /// How long a message stays in the status bar.
 const NOTICE: Duration = Duration::from_secs(4);
+/// How long something that was just copied stays lit up.
+const FLASH: Duration = Duration::from_millis(220);
+/// A press and release this close together (in pixels) are a click.
+const CLICK_SLOP: f64 = 4.0;
+/// Pressing the copy key again within this time copies the next block.
+const COPY_NEXT: Duration = Duration::from_secs(3);
 /// Background work (layout, coloring code) runs in slices this long so
 /// input stays responsive.
 const WORK_SLICE: Duration = Duration::from_millis(6);
@@ -33,11 +41,15 @@ const WORK_SLICE: Duration = Duration::from_millis(6);
 /// error paths and panics that unwind).
 pub struct TermGuard;
 
-/// Report wheel events (button tracking, SGR coordinates). Not crossterm's
-/// `EnableMouseCapture`: that also reports every pointer movement, which
-/// would wake the viewer constantly for events it ignores.
-const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
-const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+/// Report the mouse: every movement (1003) in SGR encoding (1006), and
+/// where the terminal can, in pixels instead of cells (1016).
+const MOUSE_ON: &[u8] = b"\x1b[?1003h\x1b[?1006h";
+const MOUSE_PIXELS_ON: &[u8] = b"\x1b[?1016h";
+/// The last sequence gives the mouse pointer its own shape back.
+const MOUSE_OFF: &[u8] = b"\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b]22;\x1b\\";
+/// Whether the terminal reports the mouse in pixels; found out by the
+/// startup probe, and needed again when coming back from the editor.
+static MOUSE_PIXELS: AtomicBool = AtomicBool::new(false);
 
 /// Switch the terminal to the viewer's screen: raw input, the alternate
 /// screen, no cursor, mouse reports.
@@ -46,6 +58,9 @@ fn enter_screen() -> Result<()> {
     let mut stdout = std::io::stdout();
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
     stdout.write_all(MOUSE_ON)?;
+    if MOUSE_PIXELS.load(Ordering::Relaxed) {
+        stdout.write_all(MOUSE_PIXELS_ON)?;
+    }
     stdout.flush()?;
     Ok(())
 }
@@ -112,6 +127,15 @@ impl Geometry {
     }
 }
 
+/// What the mouse pointer is over.
+#[derive(Clone, Copy, PartialEq)]
+enum Hover {
+    Nothing,
+    Text,
+    Link(u32),
+    CopyButton(usize),
+}
+
 pub struct Viewer {
     path: PathBuf,
     source: String,
@@ -142,21 +166,36 @@ pub struct Viewer {
     length_shown: bool,
     /// A message shown in the status bar until the given time.
     notice: Option<(String, Instant)>,
+    /// Whether mouse positions arrive in pixels rather than cells.
+    pixel_mouse: bool,
+    /// Where on the screen the left button went down.
+    press: Option<(f64, f64)>,
+    /// The latest pointer position not yet looked at.
+    moved: Option<(f64, f64)>,
+    hover: Hover,
+    /// A page rectangle (x, y, width, height) lit up until the given time.
+    flash: Option<([f32; 4], Instant)>,
+    /// The code block copied last, and when.
+    copied: Option<(usize, Instant)>,
+    sprites: kitty::Sprites,
 }
 
 impl Viewer {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cli: &Cli,
         source: String,
         mut engine: Engine,
         theme: Theme,
-        uploader: kitty::Uploader,
+        probe: &Probe,
         zoom: f32,
-        probe_px: Option<(u32, u32)>,
         trace: &mut Trace,
     ) -> Result<Viewer> {
-        let geom = Geometry::query(probe_px, (10, 20))?;
+        let geom = Geometry::query(probe.pixels, (10, 20))?;
+        let uploader = kitty::Uploader::new(probe.shm);
+        if probe.pixel_mouse {
+            MOUSE_PIXELS.store(true, Ordering::Relaxed);
+            write_all(MOUSE_PIXELS_ON)?;
+        }
         let doc = new_doc(&mut engine, &source, &cli.file, &theme, zoom, geom);
         let mut viewer = Viewer {
             mtime: modified(&cli.file),
@@ -179,6 +218,13 @@ impl Viewer {
             status: String::new(),
             length_shown: false,
             notice: None,
+            pixel_mouse: probe.pixel_mouse,
+            press: None,
+            moved: None,
+            hover: Hover::Nothing,
+            flash: None,
+            copied: None,
+            sprites: kitty::Sprites::default(),
         };
         // Show the top of the page before anything else is laid out.
         viewer.draw()?;
@@ -200,6 +246,10 @@ impl Viewer {
             dirty |= self.doc.done() && !self.length_shown;
             if self.notice.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
                 self.notice = None;
+                dirty = true;
+            }
+            if self.flash.is_some_and(|(_, until)| Instant::now() >= until) {
+                self.flash = None;
                 dirty = true;
             }
             if dirty || self.unfinished || (self.animating() && Instant::now() >= next_frame) {
@@ -236,13 +286,13 @@ impl Viewer {
             } else {
                 IDLE
             };
-            // Do not sleep through the end of a status bar message.
-            let wait = match &self.notice {
-                Some((_, until)) => wait.min(until.saturating_duration_since(Instant::now())),
-                None => wait,
-            };
+            // Do not sleep through the end of a message or a flash.
+            let due = [self.notice.as_ref().map(|(_, until)| *until), self.flash.map(|(_, until)| until)];
+            let timed = due.iter().flatten().map(|until| until.saturating_duration_since(Instant::now())).min();
+            let idle = wait >= IDLE;
+            let wait = timed.map_or(wait, |timed| wait.min(timed));
             if !event::poll(wait)? {
-                if wait >= IDLE && modified(&self.path) != self.mtime {
+                if idle && wait >= IDLE && modified(&self.path) != self.mtime {
                     self.reload();
                     dirty = true;
                 }
@@ -258,6 +308,11 @@ impl Viewer {
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }
+            }
+            // The pointer may have crossed many pixels since the last look;
+            // only where it is now matters.
+            if let Some(at) = self.moved.take() {
+                dirty |= self.hover_at(at)?;
             }
         }
     }
@@ -290,14 +345,32 @@ impl Viewer {
                         self.edit()?;
                         return Ok(Action::Redraw);
                     }
+                    KeyCode::Char('y') => return self.copy_code_in_view(false),
+                    KeyCode::Char('Y') => return self.copy_code_in_view(true),
                     _ => return Ok(Action::None),
                 }
             }
-            Event::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollDown => line,
-                MouseEventKind::ScrollUp => -line,
-                _ => return Ok(Action::None),
-            },
+            Event::Mouse(m) => {
+                let at = self.screen_point(m.column, m.row);
+                match m.kind {
+                    MouseEventKind::ScrollDown => line,
+                    MouseEventKind::ScrollUp => -line,
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.press = Some(at);
+                        return Ok(Action::None);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        let from = self.press.take();
+                        let clicked = from.is_some_and(|(x, y)| (x - at.0).hypot(y - at.1) <= CLICK_SLOP);
+                        return if clicked { self.click(at) } else { Ok(Action::None) };
+                    }
+                    MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                        self.moved = Some(at);
+                        return Ok(Action::None);
+                    }
+                    _ => return Ok(Action::None),
+                }
+            }
             Event::Resize(..) => {
                 let geom = Geometry::query(None, (self.geom.cell_w, self.geom.cell_h))?;
                 if geom != self.geom {
@@ -330,6 +403,121 @@ impl Viewer {
             self.scroll = target;
         }
         Action::Redraw
+    }
+
+    /// Screen position in pixels of a mouse report. Terminals that only
+    /// report cells give the middle of the cell.
+    fn screen_point(&self, column: u16, row: u16) -> (f64, f64) {
+        match self.pixel_mouse {
+            true => (column as f64, row as f64),
+            false => (
+                (column as f64 + 0.5) * self.geom.cell_w as f64,
+                (row as f64 + 0.5) * self.geom.cell_h as f64,
+            ),
+        }
+    }
+
+    /// The point of the page image at screen position `at`, unless that is
+    /// on the status bar.
+    fn page_point(&self, at: (f64, f64)) -> Option<(f32, f32)> {
+        let on_page = at.1 < self.geom.view_h() as f64;
+        on_page.then(|| ((at.0 - self.doc.origin_x as f64) as f32, (at.1 + self.scroll) as f32))
+    }
+
+    fn hover_of(&self, at: (f64, f64)) -> Hover {
+        let Some((x, y)) = self.page_point(at) else { return Hover::Nothing };
+        if let Some(code) = self.doc.copy_button(x, y) {
+            return Hover::CopyButton(code);
+        }
+        match self.doc.hit(x, y) {
+            Some(hit) if hit.inside => hit.link.map_or(Hover::Text, Hover::Link),
+            _ => Hover::Nothing,
+        }
+    }
+
+    /// The pointer is at screen position `at`: show what a click would do
+    /// through its shape and, for a link, the status bar. Returns whether
+    /// the status bar changed.
+    fn hover_at(&mut self, at: (f64, f64)) -> Result<bool> {
+        let hover = self.hover_of(at);
+        if hover == self.hover {
+            return Ok(false);
+        }
+        let shape = |hover| match hover {
+            Hover::Nothing => "default",
+            Hover::Text => "text",
+            Hover::Link(_) | Hover::CopyButton(_) => "pointer",
+        };
+        if shape(hover) != shape(self.hover) {
+            let mut out = Vec::new();
+            kitty::pointer(&mut out, shape(hover));
+            write_all(&out)?;
+        }
+        let was = std::mem::replace(&mut self.hover, hover);
+        Ok(matches!(hover, Hover::Link(_)) || matches!(was, Hover::Link(_)))
+    }
+
+    /// A click at screen position `at`.
+    fn click(&mut self, at: (f64, f64)) -> Result<Action> {
+        match self.hover_of(at) {
+            Hover::CopyButton(code) => self.copy_code(code, false),
+            Hover::Link(link) => self.follow(link),
+            Hover::Nothing | Hover::Text => Ok(Action::None),
+        }
+    }
+
+    /// Go where link number `link` points: to a heading of this document,
+    /// or out to the system's handler for the address or file.
+    fn follow(&mut self, link: u32) -> Result<Action> {
+        let Some(target) = self.doc.link(link).map(str::to_string) else { return Ok(Action::None) };
+        if let Some(fragment) = target.strip_prefix('#') {
+            match self.doc.heading(&mut self.engine, &open::percent_decode(fragment)) {
+                // A little air above the heading.
+                Some(y) => {
+                    let top = y as f64 - self.geom.cell_h as f64;
+                    self.scroll_by(top - self.target);
+                }
+                None => self.notify(format!("no heading for {target}")),
+            }
+        } else {
+            match open::open(&target, &base_dir(&self.path)) {
+                Ok(opened) => self.notify(format!("opened {opened}")),
+                Err(error) => self.notify(format!("cannot open {target}: {error}")),
+            }
+        }
+        Ok(Action::Redraw)
+    }
+
+    /// Copy code block `code` to the clipboard (with `fenced`, as written
+    /// in the source) and light it up for a moment.
+    fn copy_code(&mut self, code: usize, fenced: bool) -> Result<Action> {
+        let text = self.doc.code_text(code, fenced);
+        let mut out = Vec::new();
+        kitty::copy(&mut out, &text);
+        write_all(&out)?;
+        self.flash = Some((self.doc.code_frame(code), Instant::now() + FLASH));
+        self.copied = Some((code, Instant::now()));
+        let lines = text.lines().count();
+        let what = if fenced { "code block with its fences" } else { "code block" };
+        self.notify(format!("copied {what} ({lines} {})", if lines == 1 { "line" } else { "lines" }));
+        Ok(Action::Redraw)
+    }
+
+    /// Copy the first code block in view; pressed again soon after, the
+    /// next one, so each block on screen can be reached.
+    fn copy_code_in_view(&mut self, fenced: bool) -> Result<Action> {
+        let top = self.scroll as f32;
+        let blocks = self.doc.code_blocks(top, top + self.geom.view_h() as f32);
+        let Some(&first) = blocks.first() else {
+            self.notify("no code block in view");
+            return Ok(Action::Redraw);
+        };
+        let after_last = self
+            .copied
+            .filter(|(_, at)| at.elapsed() < COPY_NEXT)
+            .and_then(|(code, _)| blocks.iter().position(|&b| b == code))
+            .map(|i| blocks[(i + 1) % blocks.len()]);
+        self.copy_code(after_last.unwrap_or(first), fenced)
     }
 
     /// Color code blocks whose highlighting has arrived. Their tiles are
@@ -504,6 +692,7 @@ impl Viewer {
             kitty::free_all(&mut out);
             out.extend_from_slice(b"\x1b[2J");
             self.status.clear();
+            self.sprites.forget();
         }
 
         let (view_h, cell_h, cell_w) = (self.geom.view_h(), self.geom.cell_h, self.geom.cell_w);
@@ -569,9 +758,42 @@ impl Viewer {
             keep
         });
 
+        let rects = self.overlay(scroll);
+        self.sprites.draw(&mut out, &mut self.uploader, &rects, (cell_w, cell_h));
         self.status_bar(&mut out);
         out.extend_from_slice(b"\x1b[?2026l");
         write_all(&out)
+    }
+
+    /// The solid rectangles to show on top of or underneath the page, for
+    /// the viewport starting at page offset `scroll`.
+    fn overlay(&self, scroll: u32) -> Vec<kitty::Rect> {
+        // Highlights go under the text where the page lets them show
+        // through, and over it as a veil where it has its own background.
+        let z = if self.theme.page.is_some() { 1 } else { -1 };
+        let mut rects = Vec::new();
+        if let Some((area, _)) = self.flash {
+            rects.extend(self.screen_rect(area, scroll, self.theme.select, z));
+        }
+        rects
+    }
+
+    /// The visible part of page rectangle `area` (x, y, width, height) as
+    /// a rectangle on the screen.
+    fn screen_rect(&self, area: [f32; 4], scroll: u32, color: crate::theme::Rgba, z: i32) -> Option<kitty::Rect> {
+        let [x, y, w, h] = area.map(|v| v.round() as i64);
+        let (x, y) = (x + self.doc.origin_x as i64, y - scroll as i64);
+        let (left, top) = (x.max(0), y.max(0));
+        let right = (x + w).min(self.geom.page_w() as i64);
+        let bottom = (y + h).min(self.geom.view_h() as i64);
+        (left < right && top < bottom).then(|| kitty::Rect {
+            x: left as u32,
+            y: top as u32,
+            w: (right - left) as u32,
+            h: (bottom - top) as u32,
+            color,
+            z,
+        })
     }
 
     fn status_bar(&mut self, out: &mut Vec<u8>) {
@@ -588,10 +810,16 @@ impl Viewer {
             Some(line) => format!("{name}:{line}"),
             None => name.to_string(),
         };
-        let hints = "j/k scroll · space/b page · g/G top/end · e edit · +/- zoom · q quit";
-        let left = match &self.notice {
-            Some((message, _)) => format!(" {name}   {message}"),
-            None => format!(" {name}   {hints}"),
+        let hints = "j/k scroll · space/b page · g/G top/end · e edit · y copy code · +/- zoom · q quit";
+        // A message first, then where the link under the pointer leads.
+        let link = match self.hover {
+            Hover::Link(link) => self.doc.link(link),
+            _ => None,
+        };
+        let left = match (&self.notice, link) {
+            (Some((message, _)), _) => format!(" {name}   {message}"),
+            (None, Some(target)) => format!(" {name}   → {target}"),
+            (None, None) => format!(" {name}   {hints}"),
         };
         let room = cols.saturating_sub(position.chars().count() + 3);
         let left: String = if left.chars().count() <= room {

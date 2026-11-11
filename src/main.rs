@@ -7,6 +7,7 @@ mod font_cache;
 mod fonts;
 mod highlight;
 mod kitty;
+mod open;
 mod source;
 mod term;
 mod theme;
@@ -149,8 +150,7 @@ fn main() -> Result<()> {
 
     let result = engine(&mut trace).and_then(|engine| {
         let theme = Theme::new(probe.bg, probe.fg, cli.theme.dark());
-        let uploader = kitty::Uploader::new(probe.shm);
-        let mut viewer = Viewer::new(&cli, source, engine, theme, uploader, zoom, probe.pixels, &mut trace)?;
+        let mut viewer = Viewer::new(&cli, source, engine, theme, &probe, zoom, &mut trace)?;
         viewer.run()
     });
     drop(guard);

@@ -4,6 +4,7 @@
 //! All commands use `q=2` so the terminal never replies; replies would
 //! otherwise show up in the keyboard input stream.
 
+use crate::theme::Rgba;
 use base64::Engine as _;
 use flate2::{Compression, write::ZlibEncoder};
 use std::collections::VecDeque;
@@ -178,4 +179,157 @@ pub fn free(out: &mut Vec<u8>, id: u32) {
 /// Remove every image on the current screen and free the data.
 pub fn free_all(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b_Ga=d,d=A,q=2\x1b\\");
+}
+
+/// A solid rectangle on the screen, in pixels from the top left corner.
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    pub color: Rgba,
+    /// Stacking order among images; page tiles are at 0, negative is below.
+    pub z: i32,
+}
+
+/// Draws solid rectangles (selection highlight, scroll bars, flashes) by
+/// showing crops of small one-color images. Moving or resizing a rectangle
+/// is then a placement command of a few dozen bytes, with no pixels to
+/// render or send.
+#[derive(Default)]
+pub struct Sprites {
+    /// The colors uploaded so far; the image of color `n` has id `SPRITE_ID + n`.
+    colors: Vec<Rgba>,
+    /// How many placements of each image the last frame used.
+    shown: Vec<u32>,
+}
+
+/// Size of a sprite image. Larger rectangles are tiled from several crops.
+const SPRITE_W: u32 = 512;
+const SPRITE_H: u32 = 128;
+/// Image ids from here on are sprites; page tiles count up from 1.
+const SPRITE_ID: u32 = 0x4000_0000;
+
+impl Sprites {
+    /// Show exactly `rects`, replacing what the previous call showed.
+    /// `cell` is the size of a terminal cell in pixels.
+    pub fn draw(&mut self, out: &mut Vec<u8>, uploader: &mut Uploader, rects: &[Rect], cell: (u32, u32)) {
+        let mut used = vec![0u32; self.colors.len()];
+        for rect in rects {
+            let image = match self.colors.iter().position(|c| *c == rect.color) {
+                Some(image) => image,
+                None => {
+                    let Rgba(r, g, b, a) = rect.color;
+                    let pixels = [r, g, b, a].repeat((SPRITE_W * SPRITE_H) as usize);
+                    let image = self.colors.len();
+                    uploader.transmit(out, SPRITE_ID + image as u32, SPRITE_W, SPRITE_H, &pixels);
+                    self.colors.push(rect.color);
+                    used.push(0);
+                    image
+                }
+            };
+            for dy in (0..rect.h).step_by(SPRITE_H as usize) {
+                for dx in (0..rect.w).step_by(SPRITE_W as usize) {
+                    used[image] += 1;
+                    let (x, y) = (rect.x + dx, rect.y + dy);
+                    let (w, h) = ((rect.w - dx).min(SPRITE_W), (rect.h - dy).min(SPRITE_H));
+                    let _ = write!(
+                        out,
+                        "\x1b[{};{}H\x1b_Ga=p,q=2,C=1,i={},p={},x=0,y=0,w={w},h={h},X={},Y={},z={}\x1b\\",
+                        y / cell.1 + 1,
+                        x / cell.0 + 1,
+                        SPRITE_ID + image as u32,
+                        used[image],
+                        x % cell.0,
+                        y % cell.1,
+                        rect.z,
+                    );
+                }
+            }
+        }
+        // Take away what the previous frame showed beyond this one.
+        self.shown.resize(used.len(), 0);
+        for (image, (&now, &before)) in used.iter().zip(&self.shown).enumerate() {
+            for placement in now + 1..=before {
+                let _ = write!(out, "\x1b_Ga=d,d=i,q=2,i={},p={placement}\x1b\\", SPRITE_ID + image as u32);
+            }
+        }
+        self.shown = used;
+    }
+
+    /// The terminal's images were all freed: start over.
+    pub fn forget(&mut self) {
+        self.colors.clear();
+        self.shown.clear();
+    }
+}
+
+/// Put `text` on the system clipboard through the terminal (OSC 52), which
+/// also works when the terminal is on another machine.
+pub fn copy(out: &mut Vec<u8>, text: &str) {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+    let _ = write!(out, "\x1b]52;c;{b64}\x1b\\");
+}
+
+/// Set the shape of the mouse pointer over the window (OSC 22), by its CSS
+/// name; an empty name restores the terminal's own.
+pub fn pointer(out: &mut Vec<u8>, shape: &str) {
+    let _ = write!(out, "\x1b]22;{shape}\x1b\\");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placements(out: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(out)
+            .split("\x1b_G")
+            .filter(|c| c.starts_with("a=p") || c.starts_with("a=d"))
+            .map(|c| c.split("\x1b\\").next().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn rectangles_are_placed_as_crops_of_one_image() {
+        let mut sprites = Sprites::default();
+        let mut uploader = Uploader::new(false);
+        let blue = Rgba(0, 0, 255, 255);
+        let mut out = Vec::new();
+        // Wider than a sprite: two crops side by side.
+        let rect = Rect { x: 25, y: 47, w: SPRITE_W + 10, h: 30, color: blue, z: -1 };
+        sprites.draw(&mut out, &mut uploader, &[rect], (10, 20));
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert_eq!(text.matches("a=t,").count(), 1, "the color is uploaded once");
+        assert!(text.contains("\x1b[3;3H"), "placed at the cell the corner is in");
+        let id = SPRITE_ID;
+        assert_eq!(
+            placements(&out),
+            [
+                format!("a=p,q=2,C=1,i={id},p=1,x=0,y=0,w={SPRITE_W},h=30,X=5,Y=7,z=-1"),
+                format!("a=p,q=2,C=1,i={id},p=2,x=0,y=0,w=10,h=30,X=7,Y=7,z=-1"),
+            ]
+        );
+
+        // The next frame needs one crop: no new upload, the second one goes.
+        let mut out = Vec::new();
+        let rect = Rect { x: 0, y: 0, w: 40, h: 30, color: blue, z: -1 };
+        sprites.draw(&mut out, &mut uploader, &[rect], (10, 20));
+        assert!(!String::from_utf8_lossy(&out).contains("a=t,"));
+        assert_eq!(
+            placements(&out),
+            [format!("a=p,q=2,C=1,i={id},p=1,x=0,y=0,w=40,h=30,X=0,Y=0,z=-1"), format!("a=d,d=i,q=2,i={id},p=2")]
+        );
+
+        // Nothing to show: everything goes.
+        let mut out = Vec::new();
+        sprites.draw(&mut out, &mut uploader, &[], (10, 20));
+        assert_eq!(placements(&out), [format!("a=d,d=i,q=2,i={id},p=1")]);
+    }
+
+    #[test]
+    fn copies_through_osc_52() {
+        let mut out = Vec::new();
+        copy(&mut out, "héllo\n");
+        assert_eq!(out, b"\x1b]52;c;aMOpbGxvCg==\x1b\\");
+    }
 }

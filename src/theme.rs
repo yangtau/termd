@@ -54,6 +54,8 @@ pub struct Theme {
     /// Fill of a checked task box, and the check mark drawn on it.
     pub check: Rgba,
     pub check_mark: Rgba,
+    /// Highlight behind selected text.
+    pub select: Rgba,
 }
 
 const DARK_BG: Rgb = Rgb(0x0d, 0x11, 0x17);
@@ -113,6 +115,12 @@ impl Theme {
             table_head: tint(if dark { 0.07 } else { 0.05 }),
             check: tint(0.34),
             check_mark: behind.unwrap_or(if dark { DARK_BG } else { LIGHT_BG }).opaque(),
+            // Drawn under the text when the page is transparent (opaque
+            // then, if the background is known); a veil over it otherwise.
+            select: match (page, behind) {
+                (None, Some(bg)) => bg.mix(link, if dark { 0.38 } else { 0.26 }).opaque(),
+                _ => link.alpha(0.3),
+            },
         }
     }
 }

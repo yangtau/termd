@@ -156,6 +156,20 @@ enum Kind {
     Outline { x: f32, w: f32, radius: f32, line: f32, color: Rgba },
     Image { x: f32, img: RgbaImage },
     Check { x: f32 },
+    /// The "copy" symbol in the corner of a code block.
+    CopyIcon { x: f32, color: Rgba },
+}
+
+/// A code block, for copying it.
+struct CodeBlock {
+    /// Index of its text in `Layout::items`.
+    item: usize,
+    /// Its frame on the page: x, y, width, height.
+    frame: [f32; 4],
+    /// Where a click copies it: the area around its copy symbol.
+    button: [f32; 4],
+    /// The whole block in the source, fences included.
+    src: Range<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -393,6 +407,9 @@ struct Layout {
     items: Vec<Item>,
     /// Destinations of the links seen so far; text refers to them by index.
     links: Vec<String>,
+    codes: Vec<CodeBlock>,
+    /// Headings as (anchor name, page offset), for links into the document.
+    headings: Vec<(String, f32)>,
     /// Code blocks waiting for their colors, in document order.
     uncolored: VecDeque<Uncolored>,
 
@@ -522,6 +539,8 @@ impl Doc {
                 covered: 0,
                 items: Vec::new(),
                 links: Vec::new(),
+                codes: Vec::new(),
+                headings: Vec::new(),
                 uncolored: VecDeque::new(),
                 spans: Vec::new(),
                 bold: 0,
@@ -747,6 +766,51 @@ impl Doc {
     /// Destination of link number `id`.
     pub fn link(&self, id: u32) -> Option<&str> {
         self.lay.links.get(id as usize).map(String::as_str)
+    }
+
+    /// The code block whose copy symbol is at the point (`x`, `y`).
+    pub fn copy_button(&self, x: f32, y: f32) -> Option<usize> {
+        let inside = |[bx, by, bw, bh]: [f32; 4]| x >= bx && x < bx + bw && y >= by && y < by + bh;
+        self.lay.codes.iter().position(|code| inside(code.button))
+    }
+
+    /// The code blocks that show between page offsets `top` and `bottom`,
+    /// those that start in that range first.
+    pub fn code_blocks(&self, top: f32, bottom: f32) -> Vec<usize> {
+        let mut found: Vec<usize> = (0..self.lay.codes.len())
+            .filter(|&i| {
+                let [_, y, _, h] = self.lay.codes[i].frame;
+                y < bottom && y + h > top
+            })
+            .collect();
+        found.sort_by_key(|&i| self.lay.codes[i].frame[1] < top);
+        found
+    }
+
+    /// Frame of code block `code` on the page: x, y, width, height.
+    pub fn code_frame(&self, code: usize) -> [f32; 4] {
+        self.lay.codes[code].frame
+    }
+
+    /// The text of code block `code`, or with `fenced` the block as it is
+    /// written in the source.
+    pub fn code_text(&self, code: usize, fenced: bool) -> String {
+        let block = &self.lay.codes[code];
+        match &self.lay.items[block.item].kind {
+            Kind::Text { buf, .. } if !fenced => buffer_text(buf),
+            _ => self.lay.source[block.src.start as usize..block.src.end as usize].trim_end().to_string(),
+        }
+    }
+
+    /// Page offset of the heading a link to `#fragment` means, laying out
+    /// the rest of the document if it is not among the headings so far.
+    pub fn heading(&mut self, eng: &mut Engine, fragment: &str) -> Option<u32> {
+        let wanted = fragment.to_lowercase();
+        let find = |doc: &Doc| doc.lay.headings.iter().find(|(name, _)| *name == wanted).map(|(_, y)| *y as u32);
+        find(self).or_else(|| {
+            self.advance(eng, None, None);
+            find(self)
+        })
     }
 
     /// 1-based source line of the character at `offset` of text item `item`.
@@ -1089,6 +1153,11 @@ impl Layout {
         let (_, text_h) = measure(&buf);
         self.lead = baseline(&buf);
         let y = self.place(eng, text_h, mt, mb, st.line_h);
+        if self.heading.is_some() {
+            let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+            let name = heading_anchor(&text, self.headings.iter().map(|(name, _)| name.as_str()));
+            self.headings.push((name, y));
+        }
 
         self.code_boxes(&buf, self.x, y);
         let color = if self.heading == Some(6) { self.theme.dim } else { self.text_color() };
@@ -1170,13 +1239,15 @@ impl Layout {
         // Never wait for the highlighter: show the block now and let
         // `Doc::highlight` color it once the tokens are there.
         match eng.highlighter.try_get(lang, text) {
-            Some(Some(tokens)) => self.mono_block(eng, &code_spans(&tokens, &self.theme), self.theme.fg, lang, map),
-            Some(None) => self.mono_block(eng, &plain(), self.theme.fg, lang, map),
+            Some(Some(tokens)) => {
+                self.mono_block(eng, &code_spans(&tokens, &self.theme), self.theme.fg, lang, map, true)
+            }
+            Some(None) => self.mono_block(eng, &plain(), self.theme.fg, lang, map, true),
             None => {
-                self.mono_block(eng, &plain(), self.theme.fg, lang, map);
+                self.mono_block(eng, &plain(), self.theme.fg, lang, map, true);
                 let width = self.right - self.x - 2.0 * code_pad(self.em).0;
                 self.uncolored.push_back(Uncolored {
-                    item: self.items.len() - 1,
+                    item: self.codes.last().map_or(0, |code| code.item),
                     lang: lang.to_string(),
                     code: text.to_string(),
                     width,
@@ -1195,13 +1266,13 @@ impl Layout {
         let start = self.at.start + (block.len() - block.trim_start().len()) as u32;
         let map = TextMap::from_lines(html, &self.source, start..self.at.end);
         let span = Span { text: html.to_string(), ..Span::default() };
-        self.mono_block(eng, &[span], self.theme.dim, "", map);
+        self.mono_block(eng, &[span], self.theme.dim, "", map, false);
     }
 
-    /// A monospace block in a rounded frame (code blocks, raw HTML), with
-    /// `label` (the language) in its top right corner. Its text is the last
-    /// item pushed.
-    fn mono_block(&mut self, eng: &mut Engine, spans: &[Span], fg: Rgba, label: &str, map: TextMap) {
+    /// A monospace block in a rounded frame (code blocks, raw HTML). A code
+    /// block (`code`) gets its language and a copy symbol in the top right
+    /// corner. Its text is the last item pushed.
+    fn mono_block(&mut self, eng: &mut Engine, spans: &[Span], fg: Rgba, label: &str, map: TextMap, code: bool) {
         let em = self.em;
         let st = code_style(em);
         let (pad_x, pad_y) = code_pad(em);
@@ -1213,18 +1284,37 @@ impl Layout {
         let y = self.place(eng, h, em, em, (em * BODY_LINE).round());
         let (line, radius) = (self.hairline(), (0.55 * em).round());
         self.push(y, h, Kind::Outline { x: self.x, w: width, radius, line, color: self.theme.border });
+
+        // The corner: [language] [copy symbol]. Left out when the first line
+        // of code reaches under it.
+        let first_line = buf.layout_runs().next().map_or(0.0, |run| run.line_w);
+        let label_st = label_style(em);
+        let icon = (0.8 * em).round();
+        let mut corner = self.right - (0.75 * em).round();
+        let corner_y = y + (0.55 * em).round();
+        let mut button = [0.0; 4];
+        if code && first_line + em <= corner - icon - self.x - pad_x {
+            corner -= icon;
+            let icon_y = corner_y + ((label_st.line_h - icon) / 2.0).round();
+            self.push(icon_y, icon, Kind::CopyIcon { x: corner, color: self.theme.dim });
+            // Generous: the whole corner around the symbol.
+            let slop = (0.5 * em).round();
+            button = [corner - slop, y, self.right - corner + slop, icon_y - y + icon + slop];
+            corner -= (0.5 * em).round();
+        }
         if !label.is_empty() {
             let span = Span { text: label.to_string(), ..Span::default() };
-            let tag = make_buffer(eng, &[span], &label_style(em), None);
+            let tag = make_buffer(eng, &[span], &label_st, None);
             let tag_w = measure(&tag).0;
-            // Left out when the first line of code reaches under it.
-            let first_line = buf.layout_runs().next().map_or(0.0, |run| run.line_w);
-            if first_line + em <= width - 2.0 * pad_x - tag_w {
-                let (x, y) = (self.right - pad_x - tag_w, y + (0.55 * em).round());
-                self.push_label(x, y, label_style(em).line_h, tag, self.theme.dim);
+            if first_line + em <= corner - tag_w - self.x - pad_x {
+                self.push_label(corner - tag_w, corner_y, label_st.line_h, tag, self.theme.dim);
             }
         }
         self.push_text(self.x + pad_x, y + pad_y, text_h, buf, fg, map, Join::Block);
+        if code {
+            let src = self.at.clone();
+            self.codes.push(CodeBlock { item: self.items.len() - 1, frame: [self.x, y, width, h], button, src });
+        }
     }
 
     fn image_block(&mut self, eng: &mut Engine, dest: &str, alt: &str) {
@@ -1346,6 +1436,37 @@ impl Layout {
         let outline = Kind::Outline { x: self.x, w: table_w, radius, line, color: self.theme.border };
         self.push(y, table_h, outline);
     }
+}
+
+/// The text in a buffer, as it would be typed.
+fn buffer_text(buf: &Buffer) -> String {
+    let mut text = String::new();
+    for (i, line) in buf.lines.iter().enumerate() {
+        text.push_str(line.text());
+        // The last line has no line break after it, whatever it reports.
+        if i + 1 < buf.lines.len() {
+            text.push_str(line.ending().as_str());
+        }
+    }
+    text
+}
+
+/// The name a heading can be linked to with `#name`, the way GitHub derives
+/// it: lower case, punctuation dropped, spaces as hyphens, and a number
+/// appended if `taken` already has it.
+fn heading_anchor<'a>(text: &str, taken: impl Iterator<Item = &'a str> + Clone) -> String {
+    let base: String = text
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+        .map(|c| if c == ' ' { '-' } else { c })
+        .collect();
+    let free = |name: &str| !taken.clone().any(|t| t == name);
+    if free(&base) {
+        return base;
+    }
+    (1..).map(|n| format!("{base}-{n}")).find(|name| free(name)).unwrap_or(base)
 }
 
 /// The (label, value) rows of a YAML front matter block. Only top-level
@@ -1569,6 +1690,36 @@ impl Doc {
                             ..Stroke::default()
                         };
                         pm.stroke_path(&path, &paint(theme.check_mark), &stroke, shift, None);
+                    }
+                }
+                Kind::CopyIcon { x, color } => {
+                    // Two sheets: the front one whole, the back one where
+                    // it shows behind it.
+                    let (x, y, s) = (*x, item.y, item.h);
+                    let (side, r) = (s * 0.66, s * 0.16);
+                    let stroke = Stroke {
+                        width: (s * 0.085).max(1.0),
+                        line_cap: tiny_skia::LineCap::Round,
+                        line_join: tiny_skia::LineJoin::Round,
+                        ..Stroke::default()
+                    };
+                    let half = stroke.width / 2.0;
+                    if let Some(front) = rrect(x + half, y + s - side - half, side, side, [r; 4]) {
+                        pm.stroke_path(&front, &paint(*color), &stroke, shift, None);
+                    }
+                    let (left, right, top, bottom) = (x + s - side - half, x + s - half, y + half, y + side + half);
+                    let k = r * 0.5523;
+                    let mut pb = PathBuilder::new();
+                    pb.move_to(left, y + s - side - half - s * 0.14);
+                    pb.line_to(left, top + r);
+                    pb.cubic_to(left, top + r - k, left + r - k, top, left + r, top);
+                    pb.line_to(right - r, top);
+                    pb.cubic_to(right - r + k, top, right, top + r - k, right, top + r);
+                    pb.line_to(right, bottom - r);
+                    pb.cubic_to(right, bottom - r + k, right - r + k, bottom, right - r, bottom);
+                    pb.line_to(x + half + side + s * 0.14, bottom);
+                    if let Some(back) = pb.finish() {
+                        pm.stroke_path(&back, &paint(*color), &stroke, shift, None);
                     }
                 }
                 Kind::Image { x, img } => {
@@ -1871,6 +2022,48 @@ Last &amp; final paragraph.
         assert_eq!(script_runs("plain text"), vec![("plain text", false)]);
         assert_eq!(script_runs("  中文"), vec![("  中文", true)]);
         assert_eq!(script_runs(""), vec![]);
+    }
+
+    #[test]
+    fn names_headings_like_github() {
+        let none = std::iter::empty::<&str>();
+        assert_eq!(heading_anchor("Getting Started", none.clone()), "getting-started");
+        assert_eq!(heading_anchor("  What's new in v0.2.0?  ", none.clone()), "whats-new-in-v020");
+        assert_eq!(heading_anchor("开发与发布", none.clone()), "开发与发布");
+        assert_eq!(heading_anchor("snake_case & kebab-case", none), "snake_case--kebab-case");
+        let taken = ["usage", "usage-1"];
+        assert_eq!(heading_anchor("Usage", taken.iter().copied()), "usage-2");
+    }
+
+    #[test]
+    fn code_blocks_can_be_copied() {
+        let Some(mut eng) = engine() else { return };
+        let mut doc = layout(&mut eng, SAMPLE, 900);
+        doc.highlight(&mut eng, None);
+        assert_eq!(doc.code_blocks(0.0, doc.height() as f32), vec![0]);
+        assert_eq!(doc.code_text(0, false), "let a = 1;\nlet b = 2;");
+        assert_eq!(doc.code_text(0, true), "```rust\n> let a = 1;\n> let b = 2;\n> ```");
+        // The copy symbol is in the block's top right corner.
+        let [x, y, w, _] = doc.code_frame(0);
+        assert_eq!(doc.copy_button(x + w - 20.0, y + 16.0), Some(0));
+        assert_eq!(doc.copy_button(x + 20.0, y + 16.0), None);
+        assert_eq!(doc.code_blocks(0.0, y - 1.0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn headings_can_be_linked_to() {
+        let Some(mut eng) = engine() else { return };
+        let theme = Theme::new(None, None, None);
+        let opts = LayoutOpts { page_w: 900, font_px: 16.0, base_dir: PathBuf::from("."), theme };
+        let text = format!("# Top\n\n{}\n## Far Below\n\ntext\n\n## Far Below\n", "paragraph\n\n".repeat(80));
+        let mut doc = Doc::new(&mut eng, &text, opts);
+        doc.advance(&mut eng, Some(100), None);
+        assert!(!doc.done());
+        let first = doc.heading(&mut eng, "far-below").expect("found by laying out further");
+        let second = doc.heading(&mut eng, "far-below-1").unwrap();
+        assert!(first > 1000 && second > first);
+        assert_eq!(doc.heading(&mut eng, "top"), Some(doc.heading(&mut eng, "Top").unwrap()));
+        assert_eq!(doc.heading(&mut eng, "missing"), None);
     }
 
     #[test]

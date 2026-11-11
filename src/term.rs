@@ -18,6 +18,9 @@ pub struct Probe {
     pub shm: bool,
     /// Text area size in pixels (width, height), from `CSI 14 t`.
     pub pixels: Option<(u32, u32)>,
+    /// The terminal can report the mouse position in pixels (mode 1016)
+    /// rather than cells.
+    pub pixel_mouse: bool,
 }
 
 pub fn probe() -> Probe {
@@ -33,11 +36,12 @@ pub fn probe() -> Probe {
 
     let mut out = std::io::stdout().lock();
     // OSC 10/11 (foreground/background), a 1x1 graphics query, the shared
-    // memory query, CSI 14 t (pixel size), and finally DA1, which every
-    // terminal answers: it marks the end of the replies.
+    // memory query, CSI 14 t (pixel size), DECRQM for pixel mouse reports,
+    // and finally DA1, which every terminal answers: it marks the end of
+    // the replies.
     let _ = write!(
         out,
-        "\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\{shm_query}\x1b[14t\x1b[c"
+        "\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\{shm_query}\x1b[14t\x1b[?1016$p\x1b[c"
     );
     let _ = out.flush();
     let probe = parse(&read_until_da1(Duration::from_millis(1000)));
@@ -85,6 +89,9 @@ fn parse(buf: &[u8]) -> Probe {
     let mut p = Probe {
         kitty_graphics: find(buf, b"_Gi=31;OK").is_some(),
         shm: find(buf, b"_Gi=32;OK").is_some(),
+        // DECRPM: 1 = set, 2 = reset, 3 = permanently set; 0 and 4 mean it
+        // is not available.
+        pixel_mouse: find(buf, b"\x1b[?1016;").is_some_and(|i| matches!(buf.get(i + 8), Some(b'1' | b'2' | b'3'))),
         fg: parse_color(buf, b"]10;rgb:"),
         bg: parse_color(buf, b"]11;rgb:"),
         ..Probe::default()
@@ -131,8 +138,9 @@ mod tests {
     fn parses_replies() {
         let p = parse(
             b"\x1b]10;rgb:cdcd/d6d6/f4f4\x1b\\\x1b]11;rgb:1e1e/2a2a/ffff\x1b\\\x1b_Gi=31;OK\x1b\\\
-              \x1b_Gi=32;OK\x1b\\\x1b[4;1200;1920t\x1b[?62;c",
+              \x1b_Gi=32;OK\x1b\\\x1b[4;1200;1920t\x1b[?1016;2$y\x1b[?62;c",
         );
+        assert!(p.pixel_mouse);
         assert_eq!(p.fg, Some(Rgb(0xcd, 0xd6, 0xf4)));
         assert_eq!(p.bg, Some(Rgb(0x1e, 0x2a, 0xff)));
         assert!(p.kitty_graphics);
@@ -152,6 +160,9 @@ mod tests {
     fn handles_missing_replies() {
         let p = parse(b"\x1b[?62;c");
         assert_eq!((p.fg, p.bg), (None, None));
+        assert!(!p.pixel_mouse);
+        // "Not recognized" is an answer too.
+        assert!(!parse(b"\x1b[?1016;0$y\x1b[?62;c").pixel_mouse);
         assert!(!p.kitty_graphics);
         assert!(!p.shm);
         assert_eq!(p.pixels, None);
