@@ -13,6 +13,26 @@ cargo install --path .
 termd README.md
 ```
 
+也可以从 [Releases](https://github.com/yangtau/termd/releases) 下载预编译二进制（macOS arm64、Linux x86_64 静态链接），
+或者用 Nix：
+
+```sh
+nix run github:yangtau/termd -- README.md           # 最新版本
+nix run github:yangtau/termd#v0_1_0 -- README.md    # 指定版本（0.1.0 → v0_1_0）
+nix profile install github:yangtau/termd#v0_1_0
+```
+
+在自己的 flake 里使用：
+
+```nix
+inputs.termd.url = "github:yangtau/termd";
+# 最新版本
+environment.systemPackages = [ inputs.termd.packages.${pkgs.system}.default ];
+# 指定版本
+environment.systemPackages = [ (inputs.termd.lib.mkTermd pkgs "0.1.0") ];
+# 或者 overlay：nixpkgs.overlays = [ inputs.termd.overlays.default ]; 之后用 pkgs.termd
+```
+
 需要支持 Kitty 图像协议的终端（kitty、Ghostty、WezTerm 等）。暂不支持在 tmux 内运行。
 
 | 按键 | 动作 |
@@ -49,3 +69,15 @@ termd README.md
 - `src/term.rs`：启动时探测终端背景色、图像协议支持和窗口像素尺寸。
 
 字号取自终端字符格的像素高度，因此在 HiDPI 屏幕上会自动保持清晰。
+
+## 发布
+
+先把 `Cargo.toml` 里的 `version` 改成新版本并提交，然后打同名标签推送：
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` 会构建 `aarch64-apple-darwin` 和 `x86_64-unknown-linux-musl`
+两个二进制，上传到对应的 GitHub Release（附 `SHA256SUMS`），再把各平台的哈希写进默认分支的
+`nix/releases.json`。flake 就是根据这个文件下载对应版本的 release 的。

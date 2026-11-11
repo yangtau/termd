@@ -1,0 +1,163 @@
+name: Release
+
+# 推送 v* 标签时触发：构建各平台二进制，发布到 GitHub Release，
+# 然后把新版本的哈希写回默认分支的 nix/releases.json，供 flake 使用。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 静态链接的 musl 二进制，任何 x86_64 Linux（包括 NixOS）都能直接运行
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest # Apple Silicon (arm64)
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "v${cargo_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+
+      - name: Install Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          name="termd-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p dist
+          bin="target/${{ matrix.target }}/release/termd"
+          strip "$bin" || true
+          tar -C "$(dirname "$bin")" -czf "dist/${name}.tar.gz" termd
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termd-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: termd-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz | tee SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/SHA256SUMS
+
+  update-flake:
+    name: Update nix/releases.json
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: dist
+
+      - name: Record version and hashes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # 二进制文件的 target -> nix system
+          declare -A systems=(
+            [x86_64-unknown-linux-musl]=x86_64-linux
+            [aarch64-apple-darwin]=aarch64-darwin
+          )
+          entry='{}'
+          while read -r hex file; do
+            target="${file#termd-${GITHUB_REF_NAME}-}"
+            target="${target%.tar.gz}"
+            system="${systems[$target]:-}"
+            [ -n "$system" ] || { echo "::error::unknown target $target"; exit 1; }
+            # Nix SRI 格式：sha256-<base64>
+            sri="sha256-$(printf '%b' "$(sed 's/../\\x&/g' <<<"$hex")" | base64 -w0)"
+            [ "${#sri}" -eq 51 ] || { echo "::error::bad hash for $file"; exit 1; }
+            entry=$(jq -c --arg s "$system" --arg t "$target" --arg h "$sri" \
+              '.[$s] = {target: $t, hash: $h}' <<<"$entry")
+          done < dist/SHA256SUMS
+
+          jq --arg v "$version" --argjson e "$entry" '
+            .versions[$v] = $e
+            | .latest = (.versions | keys
+                | map(select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$")))
+                | sort_by(split(".") | map(tonumber)) | last)
+          ' nix/releases.json > nix/releases.json.new
+          mv nix/releases.json.new nix/releases.json
+          cat nix/releases.json
+
+      - name: Commit
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "nix/releases.json unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "nix: add release ${GITHUB_REF_NAME}"
+          for i in 1 2 3 4; do
+            git push && exit 0
+            git pull --rebase
+          done
+          exit 1
