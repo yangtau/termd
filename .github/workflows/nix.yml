@@ -1,6 +1,6 @@
 name: Nix
 
-# 在 Linux x86_64 和 macOS arm64 上构建 flake，并把结果推送到 termd.cachix.org。
+# 在 Linux x86_64 和 macOS arm64 上构建 flake，并把结果推送到 tau.cachix.org。
 # Nix 的构建结果只取决于源码，所以 main 上构建过的提交，之后打的标签也能直接命中缓存。
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
 
       - uses: cachix/cachix-action@v16
         with:
-          name: termd
+          name: tau
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           # 只推送 termd 本身，不推送 nixpkgs 里本来就能从 cache.nixos.org 下载的依赖
           pushFilter: '(-source$|\.tar\.gz$|-vendor-staging$|cargo-vendor-dir$)'

@@ -3,8 +3,8 @@
 
   # CI 构建后推送到 Cachix，用户直接下载构建结果，不需要本地编译。
   nixConfig = {
-    extra-substituters = [ "https://termd.cachix.org" ];
-    extra-trusted-public-keys = [ "termd.cachix.org-1:oAIvUJ+LNA+th44rHngB2vdqz6fcDzUdDCl6W6uXGHA=" ];
+    extra-substituters = [ "https://tau.cachix.org" ];
+    extra-trusted-public-keys = [ "tau.cachix.org-1:tqAThmpvqthNsfMUwRlljsDKPW8147I/+yzRVZnxKsA=" ];
   };
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

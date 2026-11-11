@@ -14,7 +14,7 @@ termd README.md
 ```
 
 也可以用 Nix。CI 会把 Linux x86_64 和 macOS arm64 的构建结果推送到
-[termd.cachix.org](https://termd.cachix.org)，所以通常是直接下载，不需要本地编译：
+[tau.cachix.org](https://tau.cachix.org)，所以通常是直接下载，不需要本地编译：
 
 ```sh
 nix run github:yangtau/termd -- README.md            # main 上的最新版本
@@ -27,8 +27,8 @@ flake 里已经声明了缓存地址和公钥（`nixConfig`），第一次使用
 需要把缓存加到系统的 `nix.conf`：
 
 ```
-extra-substituters = https://termd.cachix.org
-extra-trusted-public-keys = termd.cachix.org-1:oAIvUJ+LNA+th44rHngB2vdqz6fcDzUdDCl6W6uXGHA=
+extra-substituters = https://tau.cachix.org
+extra-trusted-public-keys = tau.cachix.org-1:tqAThmpvqthNsfMUwRlljsDKPW8147I/+yzRVZnxKsA=
 ```
 
 在自己的 flake 里使用：
