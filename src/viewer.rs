@@ -1,7 +1,7 @@
 //! The interactive viewer: shows the page through the terminal's image
 //! protocol and reacts to keys, the mouse and changes of the file.
 
-use crate::doc::{Doc, Engine, LayoutOpts};
+use crate::doc::{Doc, Engine, LayoutOpts, Pos};
 use crate::theme::Theme;
 use crate::term::Probe;
 use crate::{Cli, Trace, base_dir, kitty, modified, open, read_source};
@@ -33,6 +33,8 @@ const FLASH: Duration = Duration::from_millis(220);
 const CLICK_SLOP: f64 = 4.0;
 /// Pressing the copy key again within this time copies the next block.
 const COPY_NEXT: Duration = Duration::from_secs(3);
+/// Presses this close in time and place count as a double or triple click.
+const MULTI_CLICK: Duration = Duration::from_millis(400);
 /// Background work (layout, coloring code) runs in slices this long so
 /// input stays responsive.
 const WORK_SLICE: Duration = Duration::from_millis(6);
@@ -170,6 +172,19 @@ pub struct Viewer {
     pixel_mouse: bool,
     /// Where on the screen the left button went down.
     press: Option<(f64, f64)>,
+    /// When and where the last press was, and which click of a double or
+    /// triple click it was.
+    clicks: (Instant, (f64, f64), u8),
+    /// The selected text: where the selection started and where it ends
+    /// now, in either order. Empty if both are the same place.
+    selection: Option<(Pos, Pos)>,
+    /// The button is down and the selection follows the pointer.
+    dragging: bool,
+    /// Where the pointer is while dragging.
+    pointer: (f64, f64),
+    /// Scrolling speed in pixels per second while the pointer is held at
+    /// the top or bottom edge during a drag.
+    autoscroll: f64,
     /// The latest pointer position not yet looked at.
     moved: Option<(f64, f64)>,
     hover: Hover,
@@ -220,6 +235,11 @@ impl Viewer {
             notice: None,
             pixel_mouse: probe.pixel_mouse,
             press: None,
+            clicks: (Instant::now(), (0.0, 0.0), 0),
+            selection: None,
+            dragging: false,
+            pointer: (0.0, 0.0),
+            autoscroll: 0.0,
             moved: None,
             hover: Hover::Nothing,
             flash: None,
@@ -252,7 +272,9 @@ impl Viewer {
                 self.flash = None;
                 dirty = true;
             }
-            if dirty || self.unfinished || (self.animating() && Instant::now() >= next_frame) {
+            let moving = self.animating() || self.autoscroll != 0.0;
+            if dirty || self.unfinished || (moving && Instant::now() >= next_frame) {
+                self.autoscroll();
                 self.animate();
                 self.draw()?;
                 dirty = false;
@@ -279,7 +301,7 @@ impl Viewer {
             }
             let wait = if self.unfinished {
                 Duration::ZERO // only look at input, then finish the frame
-            } else if self.animating() {
+            } else if self.animating() || self.autoscroll != 0.0 {
                 next_frame.saturating_duration_since(Instant::now())
             } else if self.doc.awaits_highlight() {
                 Duration::from_millis(4) // look again soon
@@ -312,7 +334,10 @@ impl Viewer {
             // The pointer may have crossed many pixels since the last look;
             // only where it is now matters.
             if let Some(at) = self.moved.take() {
-                dirty |= self.hover_at(at)?;
+                dirty |= match self.dragging {
+                    true => self.drag_to(at),
+                    false => self.hover_at(at)?,
+                };
             }
         }
     }
@@ -324,6 +349,10 @@ impl Viewer {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
+                    KeyCode::Esc if self.selected().is_some() => {
+                        self.selection = None;
+                        return Ok(Action::Redraw);
+                    }
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
                     KeyCode::Char('c') if ctrl => return Ok(Action::Quit),
                     KeyCode::Char('j') | KeyCode::Down | KeyCode::Enter => line,
@@ -345,6 +374,8 @@ impl Viewer {
                         self.edit()?;
                         return Ok(Action::Redraw);
                     }
+                    KeyCode::Char('y') if self.selected().is_some() => return self.copy_selection(false),
+                    KeyCode::Char('Y') if self.selected().is_some() => return self.copy_selection(true),
                     KeyCode::Char('y') => return self.copy_code_in_view(false),
                     KeyCode::Char('Y') => return self.copy_code_in_view(true),
                     _ => return Ok(Action::None),
@@ -356,11 +387,15 @@ impl Viewer {
                     MouseEventKind::ScrollDown => line,
                     MouseEventKind::ScrollUp => -line,
                     MouseEventKind::Down(MouseButton::Left) => {
-                        self.press = Some(at);
-                        return Ok(Action::None);
+                        return Ok(self.press_at(at, m.modifiers.contains(KeyModifiers::SHIFT)));
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         let from = self.press.take();
+                        (self.dragging, self.autoscroll) = (false, 0.0);
+                        // Text was selected: that is what the gesture was for.
+                        if self.selected().is_some() {
+                            return self.copy_selection(false);
+                        }
                         let clicked = from.is_some_and(|(x, y)| (x - at.0).hypot(y - at.1) <= CLICK_SLOP);
                         return if clicked { self.click(at) } else { Ok(Action::None) };
                     }
@@ -409,7 +444,10 @@ impl Viewer {
     /// report cells give the middle of the cell.
     fn screen_point(&self, column: u16, row: u16) -> (f64, f64) {
         match self.pixel_mouse {
-            true => (column as f64, row as f64),
+            // The input parser takes one off every coordinate, as is right
+            // for cells (they count from 1) but not for pixels (from 0);
+            // put it back, which also undoes the wrap-around of pixel 0.
+            true => (column.wrapping_add(1) as f64, row.wrapping_add(1) as f64),
             false => (
                 (column as f64 + 0.5) * self.geom.cell_w as f64,
                 (row as f64 + 0.5) * self.geom.cell_h as f64,
@@ -421,7 +459,89 @@ impl Viewer {
     /// on the status bar.
     fn page_point(&self, at: (f64, f64)) -> Option<(f32, f32)> {
         let on_page = at.1 < self.geom.view_h() as f64;
-        on_page.then(|| ((at.0 - self.doc.origin_x as f64) as f32, (at.1 + self.scroll) as f32))
+        on_page.then_some(((at.0 - self.doc.origin_x as f64) as f32, (at.1 + self.scroll) as f32))
+    }
+
+    /// The selection in reading order, if any text is selected.
+    fn selected(&self) -> Option<(Pos, Pos)> {
+        let (a, b) = self.selection?;
+        (a != b).then_some((a.min(b), a.max(b)))
+    }
+
+    /// The left button went down at screen position `at`: start selecting
+    /// there (a word on the second click, the block on the third), or with
+    /// `extend` (shift) move the end of the current selection there.
+    fn press_at(&mut self, at: (f64, f64), extend: bool) -> Action {
+        let (last, place, count) = self.clicks;
+        let again = last.elapsed() < MULTI_CLICK && (place.0 - at.0).hypot(place.1 - at.1) <= CLICK_SLOP;
+        let count = if again { count % 3 + 1 } else { 1 };
+        self.clicks = (Instant::now(), at, count);
+        self.press = Some(at);
+        self.pointer = at;
+        let had = self.selected().is_some();
+        let hit = self.page_point(at).and_then(|(x, y)| self.doc.hit(x, y));
+        let Some(hit) = hit else {
+            self.selection = None;
+            return if had { Action::Redraw } else { Action::None };
+        };
+        self.dragging = true;
+        self.selection = match (extend, self.selection, count) {
+            (true, Some((start, _)), _) => Some((start, hit.pos())),
+            (_, _, 2) => Some(self.doc.word_at(hit.character())),
+            (_, _, 3) => Some(self.doc.block_at(hit.pos())),
+            _ => Some((hit.pos(), hit.pos())),
+        };
+        if had || self.selected().is_some() { Action::Redraw } else { Action::None }
+    }
+
+    /// The pointer moved to screen position `at` with the button down: the
+    /// selection ends there now. Held at the top or bottom edge, the page
+    /// scrolls under it. Returns whether the selection changed.
+    fn drag_to(&mut self, at: (f64, f64)) -> bool {
+        self.pointer = at;
+        let (edge, view_h) = (self.geom.cell_h as f64, self.geom.view_h() as f64);
+        // Faster the further the pointer is pushed past the edge.
+        let depth = if at.1 < edge { at.1 - edge } else { (at.1 - (view_h - edge)).max(0.0) };
+        self.autoscroll = depth / edge * 30.0 * edge;
+        // Outside the page area the nearest text of the viewport counts.
+        let y = at.1.clamp(0.0, view_h - 1.0);
+        let Some(hit) = self.page_point((at.0, y)).and_then(|(x, y)| self.doc.hit(x, y)) else { return false };
+        match &mut self.selection {
+            Some((_, end)) if *end != hit.pos() => {
+                *end = hit.pos();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Scroll for a drag held at an edge, by one frame's worth.
+    fn autoscroll(&mut self) {
+        if self.autoscroll == 0.0 {
+            return;
+        }
+        self.scroll_by(self.autoscroll * FRAME.as_secs_f64());
+        self.scroll = self.target; // follow the pointer directly, no easing
+        self.drag_to(self.pointer);
+    }
+
+    /// Copy the selected text to the clipboard: as plain text, or with
+    /// `markdown` the source it was made from.
+    fn copy_selection(&mut self, markdown: bool) -> Result<Action> {
+        let Some((from, to)) = self.selected() else { return Ok(Action::None) };
+        let text = match markdown {
+            true => self.doc.selected_source(from, to),
+            false => self.doc.selected_text(from, to),
+        };
+        let mut out = Vec::new();
+        kitty::copy(&mut out, &text);
+        write_all(&out)?;
+        let count = text.chars().count();
+        self.notify(match markdown {
+            true => format!("copied the Markdown source ({count} characters)"),
+            false => format!("copied {count} characters · Y for the Markdown source · Esc to clear"),
+        });
+        Ok(Action::Redraw)
     }
 
     fn hover_of(&self, at: (f64, f64)) -> Hover {
@@ -635,6 +755,9 @@ impl Viewer {
         self.sent.clear();
         self.placed.clear();
         self.fresh = true;
+        // Places in the old layout mean nothing in the new one.
+        (self.selection, self.dragging, self.autoscroll) = (None, false, 0.0);
+        (self.flash, self.copied, self.hover) = (None, None, Hover::Nothing);
     }
 
     fn max_scroll(&self) -> u32 {
@@ -775,6 +898,12 @@ impl Viewer {
         if let Some((area, _)) = self.flash {
             rects.extend(self.screen_rect(area, scroll, self.theme.select, z));
         }
+        if let Some((from, to)) = self.selected() {
+            let (top, bottom) = (scroll as f32, (scroll + self.geom.view_h()) as f32);
+            for area in self.doc.selection_rects(from, to, top, bottom) {
+                rects.extend(self.screen_rect(area, scroll, self.theme.select, z));
+            }
+        }
         rects
     }
 
@@ -810,7 +939,7 @@ impl Viewer {
             Some(line) => format!("{name}:{line}"),
             None => name.to_string(),
         };
-        let hints = "j/k scroll · space/b page · g/G top/end · e edit · y copy code · +/- zoom · q quit";
+        let hints = "j/k scroll · space/b page · e edit · y copy code · drag to select · q quit";
         // A message first, then where the link under the pointer leads.
         let link = match self.hover {
             Hover::Link(link) => self.doc.link(link),

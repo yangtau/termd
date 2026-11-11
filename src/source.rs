@@ -111,7 +111,7 @@ impl TextMap {
 
     /// Offset in the text of the character at source offset `src`; for a
     /// position between stretches (markup), the start of the next one.
-    pub fn from_source(&self, src: u32) -> u32 {
+    pub fn to_text(&self, src: u32) -> u32 {
         let i = self.stretches.partition_point(|(_, range)| range.end <= src);
         match self.stretches.get(i) {
             Some((start, range)) => start + src.saturating_sub(range.start),
@@ -172,10 +172,10 @@ mod tests {
         let map = TextMap::from_pieces([(6, 0..6), (5, 8..13)]);
         assert_eq!(map.range(), 0..13);
         assert_eq!([0, 5, 6, 10, 11].map(|o| map.to_source(o)), [0, 5, 8, 12, 13]);
-        assert_eq!([0, 5, 8, 12].map(|s| map.from_source(s)), [0, 5, 6, 10]);
+        assert_eq!([0, 5, 8, 12].map(|s| map.to_text(s)), [0, 5, 6, 10]);
         // Inside the markup between the pieces: the start of the next piece.
-        assert_eq!(map.from_source(7), 6);
-        assert_eq!(map.from_source(99), 11);
+        assert_eq!(map.to_text(7), 6);
+        assert_eq!(map.to_text(99), 11);
     }
 
     #[test]
@@ -199,7 +199,7 @@ mod tests {
         for (offset, ch) in text.char_indices().filter(|(_, c)| *c != '\n') {
             let src = map.to_source(offset as u32) as usize;
             assert_eq!(source[src..].chars().next(), Some(ch), "offset {offset}");
-            assert_eq!(map.from_source(src as u32), offset as u32);
+            assert_eq!(map.to_text(src as u32), offset as u32);
         }
         assert_eq!(lines.line_of(map.to_source(0)), 4);
         assert_eq!(lines.line_of(map.to_source(11)), 5);

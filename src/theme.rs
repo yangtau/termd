@@ -101,6 +101,16 @@ impl Theme {
             Some(bg) => bg.mix(fg, t).opaque(),
             None => fg.alpha(t),
         };
+        // Fills that text sits on (inline code, table headers) are half
+        // transparent, so the selection highlight underneath shows through
+        // them. Half of twice the tint looks the same as the tint itself,
+        // and - unlike a faint overlay of the text color - nearly the same
+        // however the terminal blends, because the color is close to the
+        // background.
+        let wash = |t: f32| match (page, behind) {
+            (None, Some(bg)) => bg.mix(fg, 2.0 * t).alpha(0.5),
+            _ => tint(t),
+        };
         let link = if dark { Rgb(0x6c, 0xb6, 0xff) } else { Rgb(0x09, 0x69, 0xda) };
         Theme {
             dark,
@@ -109,10 +119,10 @@ impl Theme {
             dim: tint(0.58),
             quote: tint(0.8),
             link: link.opaque(),
-            code_bg: tint(if dark { 0.1 } else { 0.065 }),
+            code_bg: wash(if dark { 0.1 } else { 0.065 }),
             border: tint(if dark { 0.2 } else { 0.14 }),
             quote_bar: tint(0.38),
-            table_head: tint(if dark { 0.07 } else { 0.05 }),
+            table_head: wash(if dark { 0.07 } else { 0.05 }),
             check: tint(0.34),
             check_mark: behind.unwrap_or(if dark { DARK_BG } else { LIGHT_BG }).opaque(),
             // Drawn under the text when the page is transparent (opaque
@@ -136,7 +146,9 @@ mod tests {
         assert_eq!(t.page, None);
         assert_eq!(t.fg, Rgba(205, 214, 244, 255));
         // Tints are opaque mixes of the terminal's two colors.
-        assert_eq!(t.code_bg, Rgb(30, 30, 46).mix(Rgb(205, 214, 244), 0.1).opaque());
+        assert_eq!(t.border, Rgb(30, 30, 46).mix(Rgb(205, 214, 244), 0.2).opaque());
+        // Fills under text are half transparent and look like a 10% tint.
+        assert_eq!(t.code_bg, Rgb(30, 30, 46).mix(Rgb(205, 214, 244), 0.2).alpha(0.5));
     }
 
     #[test]

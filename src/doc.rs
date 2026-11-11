@@ -94,6 +94,18 @@ pub struct Anchor {
     frac: f32,
 }
 
+impl Hit {
+    /// The character boundary nearest to the point.
+    pub fn pos(&self) -> Pos {
+        Pos { item: self.item, offset: self.offset }
+    }
+
+    /// The start of the character at the point.
+    pub fn character(&self) -> Pos {
+        Pos { item: self.item, offset: self.character }
+    }
+}
+
 impl Anchor {
     /// Source offset of the first character of the anchored line.
     pub fn src(self) -> u32 {
@@ -106,6 +118,14 @@ impl Anchor {
     }
 }
 
+/// A place in the document's text: a character boundary in a text item.
+/// Ordered the way the document reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pos {
+    pub item: u32,
+    pub offset: u32,
+}
+
 /// What is at a point of the page.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hit {
@@ -113,6 +133,8 @@ pub struct Hit {
     pub item: u32,
     /// Offset in the item's text of the character boundary nearest to it.
     pub offset: u32,
+    /// Offset of the character it is on (or nearest to on its line).
+    pub character: u32,
     /// Whether the point is on one of the item's characters, rather than
     /// beside or between its lines.
     pub inside: bool,
@@ -123,8 +145,6 @@ pub struct Hit {
 struct Item {
     y: f32,
     h: f32,
-    /// The part of the source this was made from.
-    src: Range<u32>,
     kind: Kind,
 }
 
@@ -136,6 +156,8 @@ struct Content {
     line_starts: Vec<u32>,
     /// What separates this text from the one before it when both are copied.
     join: Join,
+    /// What stands for its list marker in copied text ("- ", "2. ").
+    prefix: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -302,7 +324,7 @@ fn make_buffer(eng: &mut Engine, spans: &[Span], st: &TextStyle, width: Option<f
 
 /// What a content text item needs to know about its text: `map` says where
 /// it comes from.
-fn content(buf: &Buffer, map: TextMap, join: Join) -> Option<Box<Content>> {
+fn content(buf: &Buffer, map: TextMap, join: Join, prefix: String) -> Option<Box<Content>> {
     let mut at = 0;
     let line_starts = buf
         .lines
@@ -313,7 +335,7 @@ fn content(buf: &Buffer, map: TextMap, join: Join) -> Option<Box<Content>> {
             start
         })
         .collect();
-    Some(Box::new(Content { map, line_starts, join }))
+    Some(Box::new(Content { map, line_starts, join, prefix }))
 }
 
 /// The map of text shaped from `spans`.
@@ -424,6 +446,11 @@ struct Layout {
     lists: Vec<Option<u64>>,
     /// Marker waiting to be drawn next to the next placed block.
     marker: Option<Marker>,
+    /// The marker just drawn, as text, for the text it belongs to.
+    prefix: String,
+    /// The last text placed was a tight list item, so the next one of the
+    /// same kind follows on the next line rather than after an empty one.
+    in_tight_list: bool,
     /// Baseline of the first line of the block about to be placed, so a
     /// list number can sit on the same baseline as its text.
     lead: Option<f32>,
@@ -550,6 +577,8 @@ impl Doc {
                 heading: None,
                 lists: Vec::new(),
                 marker: None,
+                prefix: String::new(),
+                in_tight_list: false,
                 lead: None,
                 quotes: Vec::new(),
                 code: None,
@@ -692,7 +721,7 @@ impl Doc {
             .filter(|(_, _, _, _, content)| content.map.range().end > anchor.src)
             .min_by_key(|(_, _, _, _, content)| content.map.range().start);
         let Some((_, item, _, buf, content)) = found else { return self.height };
-        let offset = content.map.from_source(anchor.src.max(content.map.range().start));
+        let offset = content.map.to_text(anchor.src.max(content.map.range().start));
         let line = content.line_starts.partition_point(|&start| start <= offset).saturating_sub(1);
         let in_line = offset - content.line_starts[line];
         let run = buf
@@ -740,27 +769,149 @@ impl Doc {
         let on_line = ly >= run.line_top && ly < run.line_top + run.line_height;
         let line_start = content.line_starts.get(run.line_i).copied().unwrap_or(0);
         let under = run.glyphs.iter().find(|g| lx >= g.x && lx < g.x + g.w);
-        let (in_line, link) = match under {
+        let (in_line, character, link) = match under {
             Some(g) => {
                 let link = (g.metadata >> META_LINK_SHIFT).checked_sub(1).map(|id| id as u32);
-                (if lx < g.x + g.w / 2.0 { g.start } else { g.end }, link)
+                (if lx < g.x + g.w / 2.0 { g.start } else { g.end }, g.start, link)
             }
             // Beside the line: its nearer end.
             None => {
                 let before = run.glyphs.first().is_none_or(|g| lx < g.x);
-                let end = match before {
-                    true => run.glyphs.iter().map(|g| g.start).min(),
-                    false => run.glyphs.iter().map(|g| g.end).max(),
+                let (boundary, character) = match before {
+                    true => (run.glyphs.iter().map(|g| g.start).min(), run.glyphs.iter().map(|g| g.start).min()),
+                    false => (run.glyphs.iter().map(|g| g.end).max(), run.glyphs.iter().map(|g| g.start).max()),
                 };
-                (end.unwrap_or(0), None)
+                (boundary.unwrap_or(0), character.unwrap_or(0), None)
             }
         };
         Some(Hit {
             item: index as u32,
             offset: line_start + in_line as u32,
+            character: line_start + character as u32,
             inside: on_line && under.is_some(),
             link,
         })
+    }
+
+    /// The highlight for the text between `from` and `to`, as rectangles
+    /// (x, y, width, height) on the page, as far as they show between page
+    /// offsets `top` and `bottom`.
+    pub fn selection_rects(&self, from: Pos, to: Pos, top: f32, bottom: f32) -> Vec<[f32; 4]> {
+        let mut rects = Vec::new();
+        for (index, item, x, buf, content) in self.texts() {
+            let index = index as u32;
+            if index < from.item || index > to.item || item.y >= bottom || item.y + item.h <= top {
+                continue;
+            }
+            let start = if index == from.item { from.offset } else { 0 };
+            let end = if index == to.item { to.offset } else { u32::MAX };
+            for run in buf.layout_runs() {
+                let line_top = item.y + run.line_top;
+                if line_top >= bottom || line_top + run.line_height <= top {
+                    continue;
+                }
+                let line_start = content.line_starts.get(run.line_i).copied().unwrap_or(0);
+                let selected = run
+                    .glyphs
+                    .iter()
+                    .filter(|g| line_start + (g.start as u32) < end && line_start + g.end as u32 > start);
+                let extent = selected.fold(None, |extent: Option<(f32, f32)>, g| {
+                    let (lo, hi) = extent.unwrap_or((g.x, g.x + g.w));
+                    Some((lo.min(g.x), hi.max(g.x + g.w)))
+                });
+                match extent {
+                    Some((lo, hi)) => rects.push([x + lo, line_top, hi - lo, run.line_height]),
+                    // An empty line inside the selection still shows.
+                    None if run.glyphs.is_empty() && line_start >= start && line_start < end => {
+                        rects.push([x, line_top, (0.4 * self.lay.em).round(), run.line_height]);
+                    }
+                    None => {}
+                }
+            }
+        }
+        rects
+    }
+
+    /// The text between `from` and `to` as plain text: blocks separated by
+    /// empty lines, list items with their markers, table cells by tabs.
+    pub fn selected_text(&self, from: Pos, to: Pos) -> String {
+        let mut out = String::new();
+        for (index, _, _, buf, content) in self.texts() {
+            let index = index as u32;
+            if index < from.item || index > to.item {
+                continue;
+            }
+            let text = buffer_text(buf);
+            let clamp = |offset: u32| {
+                let mut at = (offset as usize).min(text.len());
+                while !text.is_char_boundary(at) {
+                    at -= 1;
+                }
+                at
+            };
+            let start = if index == from.item { clamp(from.offset) } else { 0 };
+            let end = if index == to.item { clamp(to.offset) } else { text.len() };
+            if !out.is_empty() {
+                out.push_str(match content.join {
+                    Join::Block => "\n\n",
+                    Join::Line => "\n",
+                    Join::Cell => "\t",
+                });
+            }
+            // The marker belongs to the start of the item.
+            if start == 0 && end > 0 {
+                out.push_str(&content.prefix);
+            }
+            out.push_str(&text[start..end.max(start)]);
+        }
+        out
+    }
+
+    /// The Markdown behind the text between `from` and `to`. Within one
+    /// source line that is exactly the stretch between the two characters;
+    /// across lines it is the whole lines, so that list markers, fences and
+    /// table rows come along intact.
+    pub fn selected_source(&self, from: Pos, to: Pos) -> String {
+        let src = |pos: Pos| match &self.lay.items.get(pos.item as usize)?.kind {
+            Kind::Text { content: Some(content), .. } => Some(content.map.to_source(pos.offset)),
+            _ => None,
+        };
+        let (Some(start), Some(end)) = (src(from), src(to)) else { return String::new() };
+        let range = start..end.max(start);
+        let range = match self.lines.line_of(range.start) == self.lines.line_of(range.end.saturating_sub(1)) {
+            true => range,
+            false => self.lines.whole_lines(range),
+        };
+        self.lay.source.get(range.start as usize..range.end as usize).unwrap_or("").to_string()
+    }
+
+    /// The word that the character at `pos` is part of, for selecting by
+    /// double click: a run of letters and digits, or a single CJK or other
+    /// character.
+    pub fn word_at(&self, pos: Pos) -> (Pos, Pos) {
+        let Some(Kind::Text { buf, .. }) = self.lay.items.get(pos.item as usize).map(|item| &item.kind) else {
+            return (pos, pos);
+        };
+        let text = buffer_text(buf);
+        let at = (pos.offset as usize).min(text.len());
+        let is_word = |c: char| (c.is_alphanumeric() || c == '_') && !is_cjk(c);
+        let Some(first) = text.get(at..).and_then(|rest| rest.chars().next()) else { return (pos, pos) };
+        let start = at;
+        let (mut lo, mut hi) = (start, start + first.len_utf8());
+        if is_word(first) {
+            lo = text[..start].char_indices().rev().take_while(|(_, c)| is_word(*c)).last().map_or(start, |(i, _)| i);
+            hi += text[hi..].chars().take_while(|c| is_word(*c)).map(char::len_utf8).sum::<usize>();
+        }
+        (Pos { item: pos.item, offset: lo as u32 }, Pos { item: pos.item, offset: hi as u32 })
+    }
+
+    /// The whole text item `pos` is in, for selecting by triple click.
+    pub fn block_at(&self, pos: Pos) -> (Pos, Pos) {
+        let len = match self.lay.items.get(pos.item as usize).map(|item| &item.kind) {
+            Some(Kind::Text { buf, .. }) => buffer_text(buf).len() as u32,
+            _ => 0,
+        };
+        (Pos { item: pos.item, offset: 0 }, Pos { item: pos.item, offset: len })
     }
 
     /// Destination of link number `id`.
@@ -814,6 +965,7 @@ impl Doc {
     }
 
     /// 1-based source line of the character at `offset` of text item `item`.
+    #[cfg(test)]
     pub fn line_of(&self, hit: &Hit) -> Option<u32> {
         match &self.lay.items.get(hit.item as usize)?.kind {
             Kind::Text { content: Some(content), .. } => Some(self.lines.line_of(content.map.to_source(hit.offset))),
@@ -884,6 +1036,8 @@ impl Layout {
             }
             Tag::List(start) => {
                 self.flush_inline(eng, true);
+                // A list starts a new block; a nested one continues its item.
+                self.in_tight_list &= !self.lists.is_empty();
                 self.lists.push(start);
                 self.x += LIST_INDENT * self.em;
             }
@@ -1058,18 +1212,17 @@ impl Layout {
         y
     }
 
-    /// Add a shape or a piece of decoration, made from the source the
-    /// parser is at.
+    /// Add a shape or a piece of decoration.
     fn push(&mut self, y: f32, h: f32, kind: Kind) {
-        self.items.push(Item { y, h, src: self.at.clone(), kind });
+        self.items.push(Item { y, h, kind });
     }
 
     /// Add text that is document content; `map` says where it comes from.
+    #[allow(clippy::too_many_arguments)]
     fn push_text(&mut self, x: f32, y: f32, h: f32, buf: Buffer, color: Rgba, map: TextMap, join: Join) {
-        let src = map.range();
-        self.covered = self.covered.max(src.end);
-        let content = content(&buf, map, join);
-        self.items.push(Item { y, h, src, kind: Kind::Text { x, buf, color, content } });
+        self.covered = self.covered.max(map.range().end);
+        let content = content(&buf, map, join, std::mem::take(&mut self.prefix));
+        self.items.push(Item { y, h, kind: Kind::Text { x, buf, color, content } });
     }
 
     /// Add text that is decoration: a list number, a label.
@@ -1084,6 +1237,12 @@ impl Layout {
     fn draw_marker(&mut self, eng: &mut Engine, marker: Marker, y: f32, line_h: f32, lead: Option<f32>) {
         let em = self.em;
         let color = self.text_color();
+        let indent = "  ".repeat(self.lists.len().saturating_sub(1));
+        self.prefix = match marker {
+            Marker::Bullet => format!("{indent}- "),
+            Marker::Number(n) => format!("{indent}{n}. "),
+            Marker::Task(checked) => format!("{indent}[{}] ", if checked { 'x' } else { ' ' }),
+        };
         match marker {
             // Disc, ring, square by nesting depth, like a browser.
             Marker::Bullet => {
@@ -1161,7 +1320,8 @@ impl Layout {
 
         self.code_boxes(&buf, self.x, y);
         let color = if self.heading == Some(6) { self.theme.dim } else { self.text_color() };
-        let join = if tight { Join::Line } else { Join::Block };
+        let join = if tight && self.in_tight_list { Join::Line } else { Join::Block };
+        self.in_tight_list = tight && self.heading.is_none() && !self.lists.is_empty();
         self.push_text(self.x, y, text_h, buf, color, span_map(&spans), join);
     }
 
@@ -2033,6 +2193,80 @@ Last &amp; final paragraph.
         assert_eq!(heading_anchor("snake_case & kebab-case", none), "snake_case--kebab-case");
         let taken = ["usage", "usage-1"];
         assert_eq!(heading_anchor("Usage", taken.iter().copied()), "usage-2");
+    }
+
+    /// The place in the text right before the first character of `needle`.
+    fn before(doc: &Doc, needle: &str) -> Pos {
+        let (x, y) = find(doc, needle);
+        doc.hit(x - 1.0, y).unwrap().pos()
+    }
+
+    #[test]
+    fn selections_copy_as_plain_text() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, SAMPLE, 900);
+        let text = |from: &str, to: &str| doc.selected_text(before(&doc, from), before(&doc, to));
+        // Inside one paragraph; the source line break is a space.
+        assert_eq!(text("paragraph", "with"), "paragraph second line ");
+        // Across blocks: an empty line between them, markers on list items.
+        assert_eq!(text("in it", "two"), "in it.\n\n- item one\n- item ");
+        // Starting inside an item leaves its marker out.
+        assert_eq!(text("one", "two"), "one\n- item ");
+        // Code keeps its lines; a table is tab-separated rows.
+        assert_eq!(text("quoted", "Value"), "quoted\n\nlet a = 1;\nlet b = 2;\n\nKey\t");
+        assert_eq!(text("Key", "Last"), "Key\tValue\nzeta\tomega\n\n");
+        assert_eq!(text("Last", "final"), "Last & ");
+    }
+
+    #[test]
+    fn selections_copy_as_markdown() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, SAMPLE, 900);
+        let source = |from: &str, to: &str| doc.selected_source(before(&doc, from), before(&doc, to));
+        // Within a line: exactly what is between the two characters.
+        assert_eq!(source("line with", "in it"), "line with [a link](https://example.com/x) ");
+        assert_eq!(source("Last", "final"), "Last &amp; ");
+        // Across lines: the whole lines, markup and all.
+        assert_eq!(source("one", "two"), "- item one\n- item **two**");
+        assert_eq!(source("let a", "b = 2"), "> let a = 1;\n> let b = 2;");
+        assert_eq!(source("Key", "omega"), "| Key | Value |\n|---|---|\n| zeta | omega |");
+    }
+
+    #[test]
+    fn selection_highlight_follows_the_lines() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, SAMPLE, 200);
+        let (from, to) = (before(&doc, "First"), before(&doc, "item one"));
+        let rects = doc.selection_rects(from, to, 0.0, doc.height() as f32);
+        // The paragraph wraps at this width: one rectangle per line, each
+        // right under the one before.
+        assert!(rects.len() >= 3, "{rects:?}");
+        for pair in rects.windows(2) {
+            assert!(pair[1][1] >= pair[0][1] + pair[0][3] - 0.5, "{pair:?}");
+        }
+        assert!(rects.iter().all(|r| r[2] > 0.0 && r[3] > 0.0));
+        // Nothing outside the requested range of the page.
+        let (_, y) = find(&doc, "First");
+        assert!(doc.selection_rects(from, to, 0.0, y - 30.0).is_empty());
+        // Nothing selected, nothing highlighted.
+        assert!(doc.selection_rects(from, from, 0.0, doc.height() as f32).is_empty());
+    }
+
+    #[test]
+    fn double_click_selects_a_word() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, "Hello wide_world, 中文 end.\n", 900);
+        let word = |needle: &str| {
+            let (x, y) = find(&doc, needle);
+            let (from, to) = doc.word_at(doc.hit(x, y).unwrap().character());
+            doc.selected_text(from, to)
+        };
+        assert_eq!(word("llo"), "Hello");
+        assert_eq!(word("world"), "wide_world");
+        assert_eq!(word(","), ",");
+        assert_eq!(word("文"), "文");
+        let (from, to) = doc.block_at(before(&doc, "wide"));
+        assert_eq!(doc.selected_text(from, to), "Hello wide_world, 中文 end.");
     }
 
     #[test]
