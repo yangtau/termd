@@ -11,7 +11,7 @@
 //! The page image covers only the text column, not the full terminal width,
 //! and its background is transparent unless the theme asks for a page color.
 
-use crate::fonts::{Fonts, Installed};
+use crate::fonts::{Choice, Face, Fonts, Installed};
 use crate::highlight::{Highlighter, Token};
 use crate::theme::{Rgb, Rgba, Theme};
 use cosmic_text::{
@@ -25,21 +25,26 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
-/// Glyph metadata flags: inline code (gets a background) and struck-through
-/// text. cosmic-text has its own strikethrough, but it loses the decoration
-/// on runs that use a different font than the paragraph's first one.
+/// Glyph metadata flags: inline code (gets a background), struck-through
+/// text and links (underlined). cosmic-text has its own decorations, but it
+/// loses them on runs that use a different font than the paragraph's first.
 const META_CODE: usize = 1;
 const META_STRIKE: usize = 2;
+const META_LINK: usize = 4;
 
-const HEADING_SCALE: [f32; 6] = [1.85, 1.45, 1.2, 1.0, 0.9, 0.85];
+const HEADING_SCALE: [f32; 6] = [1.75, 1.35, 1.15, 1.0, 0.9, 0.85];
 const BODY_LINE: f32 = 1.65;
 const HEADING_LINE: f32 = 1.3;
 const CODE_SCALE: f32 = 0.88;
 const CODE_LINE: f32 = 1.55;
 /// Content column width limit, in em.
 const MAX_WIDTH_EM: f32 = 46.0;
+/// Indent of a list level, in em.
+const LIST_INDENT: f32 = 2.1;
 const REGULAR: u16 = 400;
-/// Headings and strong text. Semibold where the font has it (SF, PingFang).
+/// Headings: set in the body face at a larger size, only slightly heavier.
+const MEDIUM: u16 = 500;
+/// Strong text and table headers.
 const BOLD: u16 = 600;
 
 /// Long-lived rendering state: fonts, glyph cache, highlighted code and
@@ -109,28 +114,34 @@ struct Span {
     italic: bool,
     strike: bool,
     code: bool,
+    link: bool,
     color: Option<Rgba>,
 }
 
 struct TextStyle {
     size: f32,
     line_h: f32,
-    mono: bool,
+    face: Face,
     weight: u16,
 }
 
 fn text_style(size: f32, line_scale: f32) -> TextStyle {
-    TextStyle { size, line_h: (size * line_scale).round(), mono: false, weight: REGULAR }
+    TextStyle { size, line_h: (size * line_scale).round(), face: Face::Body, weight: REGULAR }
 }
 
 /// Text style of code blocks.
 fn code_style(em: f32) -> TextStyle {
-    TextStyle { mono: true, ..text_style((em * CODE_SCALE).round(), CODE_LINE) }
+    TextStyle { face: Face::Mono, ..text_style((em * CODE_SCALE).round(), CODE_LINE) }
+}
+
+/// Small sans-serif labels: front matter keys, the language of a code block.
+fn label_style(em: f32) -> TextStyle {
+    TextStyle { face: Face::Ui, ..text_style((em * 0.8).round(), 1.5) }
 }
 
 /// Horizontal and vertical padding inside a code block.
 fn code_pad(em: f32) -> (f32, f32) {
-    ((1.1 * em).round(), (0.85 * em).round())
+    ((1.2 * em).round(), (0.95 * em).round())
 }
 
 fn code_spans(tokens: &[Token], theme: &Theme) -> Vec<Span> {
@@ -190,25 +201,22 @@ fn make_buffer(eng: &mut Engine, spans: &[Span], st: &TextStyle, width: Option<f
 
     // Every run names its family and a weight that family has, so
     // cosmic-text never needs to go looking for a fallback font.
-    let attrs = |cjk: bool, mono: bool, weight: u16| {
-        let fam = match (&fonts.cjk, cjk, mono) {
-            (Some(cjk_fam), true, _) => cjk_fam,
-            (_, _, true) => &fonts.mono,
-            _ => &fonts.sans,
-        };
+    let attrs = |cjk: bool, face: Face, weight: u16| {
+        let fam = fonts.family(face, cjk);
         Attrs::new().family(Family::Name(&fam.name)).weight(Weight(fam.weight(weight)))
     };
-    let base = attrs(false, st.mono, st.weight);
+    let base = attrs(false, st.face, st.weight);
     let mut rich = Vec::new();
     for s in spans {
         let weight = if s.bold { BOLD.max(st.weight) } else { st.weight };
+        let face = if s.code { Face::Mono } else { st.face };
         for (piece, cjk) in script_runs(&s.text) {
-            let mut a = attrs(cjk, st.mono || s.code, weight);
+            let mut a = attrs(cjk, face, weight);
             if s.italic {
                 a = a.style(Style::Italic);
             }
-            let flags = if s.code { META_CODE } else { 0 } | if s.strike { META_STRIKE } else { 0 };
-            a = a.metadata(flags);
+            let flag = |on: bool, flag: usize| if on { flag } else { 0 };
+            a = a.metadata(flag(s.code, META_CODE) | flag(s.strike, META_STRIKE) | flag(s.link, META_LINK));
             if s.code {
                 a = a.metrics(Metrics::new(st.size * CODE_SCALE, st.line_h));
             }
@@ -241,8 +249,8 @@ fn is_blank(spans: &[Span]) -> bool {
 
 impl Engine {
     /// `installed` is the result of `fonts::scan`.
-    pub fn new(installed: Installed, highlighter: Highlighter, sans: Option<&str>, mono: Option<&str>) -> Engine {
-        let (fs, fonts) = Fonts::new(installed, sans, mono);
+    pub fn new(installed: Installed, highlighter: Highlighter, choice: &Choice) -> Engine {
+        let (fs, fonts) = Fonts::new(installed, choice);
         Engine { fs, fonts, swash: SwashCache::new(), highlighter, images: HashMap::new() }
     }
 
@@ -258,8 +266,7 @@ impl Engine {
 
     /// The families in use, for `TERMD_DEBUG`.
     pub fn font_names(&self) -> String {
-        let cjk = self.fonts.cjk.as_ref().map_or("none", |f| f.name.as_str());
-        format!("sans={:?} mono={:?} cjk={:?}", self.fonts.sans.name, self.fonts.mono.name, cjk)
+        self.fonts.names()
     }
 }
 
@@ -328,7 +335,8 @@ struct Layout {
     /// Open image: (destination, alt text).
     image: Option<(String, String)>,
     table: Option<Table>,
-    in_meta: bool,
+    /// Open front matter block and its text so far.
+    meta: Option<String>,
     /// A soft line break was seen and not yet turned into a space.
     soft_break: bool,
 }
@@ -437,7 +445,7 @@ impl Doc {
                 html: None,
                 image: None,
                 table: None,
-                in_meta: false,
+                meta: None,
                 soft_break: false,
             },
         }
@@ -595,7 +603,7 @@ impl Layout {
             Tag::BlockQuote(_) => {
                 self.flush_inline(eng, true);
                 self.quotes.push((self.x, None));
-                self.x += 1.2 * self.em;
+                self.x += 1.25 * self.em;
             }
             Tag::CodeBlock(kind) => {
                 self.flush_inline(eng, true);
@@ -608,7 +616,7 @@ impl Layout {
             Tag::List(start) => {
                 self.flush_inline(eng, true);
                 self.lists.push(start);
-                self.x += 1.7 * self.em;
+                self.x += LIST_INDENT * self.em;
             }
             Tag::Item => {
                 self.flush_inline(eng, true);
@@ -629,7 +637,7 @@ impl Layout {
             Tag::Strikethrough => self.strike += 1,
             Tag::Link { .. } => self.link += 1,
             Tag::Image { dest_url, .. } => self.image = Some((dest_url.to_string(), String::new())),
-            Tag::MetadataBlock(_) => self.in_meta = true,
+            Tag::MetadataBlock(_) => self.meta = Some(String::new()),
             _ => {}
         }
     }
@@ -643,9 +651,9 @@ impl Layout {
             }
             TagEnd::BlockQuote(_) => {
                 self.flush_inline(eng, true);
-                self.x -= 1.2 * self.em;
+                self.x -= 1.25 * self.em;
                 if let Some((bar_x, Some(top))) = self.quotes.pop() {
-                    let w = (0.2 * self.em).max(2.0).round();
+                    let w = (0.17 * self.em).max(2.0).round();
                     self.rect(bar_x, top, w, self.y - top, w / 2.0, self.theme.quote_bar);
                 }
             }
@@ -662,9 +670,9 @@ impl Layout {
             TagEnd::List(_) => {
                 self.flush_inline(eng, true);
                 self.lists.pop();
-                self.x -= 1.7 * self.em;
+                self.x -= LIST_INDENT * self.em;
                 if self.lists.is_empty() {
-                    self.margin = self.margin.max(0.9 * self.em);
+                    self.margin = self.margin.max(self.em);
                 }
             }
             TagEnd::Item => {
@@ -672,7 +680,7 @@ impl Layout {
                 // An item with no content still gets its marker.
                 if self.marker.is_some() {
                     let line = (self.em * BODY_LINE).round();
-                    self.place(eng, line, 0.2 * self.em, 0.2 * self.em, line);
+                    self.place(eng, line, 0.32 * self.em, 0.32 * self.em, line);
                 }
             }
             TagEnd::TableCell => {
@@ -704,7 +712,11 @@ impl Layout {
                     self.image_block(eng, &dest, &alt);
                 }
             }
-            TagEnd::MetadataBlock(_) => self.in_meta = false,
+            TagEnd::MetadataBlock(_) => {
+                if let Some(meta) = self.meta.take() {
+                    self.front_matter(eng, &meta);
+                }
+            }
             _ => {}
         }
     }
@@ -719,7 +731,8 @@ impl Layout {
                 last.text.push(' ');
             }
         }
-        if self.in_meta {
+        if let Some(meta) = &mut self.meta {
+            meta.push_str(t);
         } else if let Some((_, buf)) = &mut self.code {
             buf.push_str(t);
         } else if let Some(html) = &mut self.html {
@@ -733,13 +746,20 @@ impl Layout {
                 italic: self.italic > 0,
                 strike: self.strike > 0,
                 code,
-                color: (self.link > 0).then_some(self.theme.link),
+                link: self.link > 0,
+                // Struck-through text steps back, like the reference
+                // renderers do it.
+                color: match (self.link > 0, self.strike > 0) {
+                    (true, _) => Some(self.theme.link),
+                    (false, true) => Some(self.theme.dim),
+                    _ => None,
+                },
             });
         }
     }
 
     fn text_color(&self) -> Rgba {
-        if self.quotes.is_empty() { self.theme.fg } else { self.theme.dim }
+        if self.quotes.is_empty() { self.theme.fg } else { self.theme.quote }
     }
 
     /// Reserve vertical space for a block of height `h` and return its top.
@@ -774,12 +794,12 @@ impl Layout {
         match marker {
             // Disc, ring, square by nesting depth, like a browser.
             Marker::Bullet => {
-                let d = (0.32 * em).round().max(3.0);
-                let (x, y) = (self.x - 0.95 * em, y + ((line_h - d) / 2.0).round());
+                let d = (0.3 * em).round().max(3.0);
+                let (x, y) = ((self.x - 1.15 * em).round(), y + ((line_h - d) / 2.0).round());
                 match self.lists.len() {
                     0 | 1 => self.rect(x, y, d, d, d / 2.0, color),
                     2 => {
-                        let line = (d * 0.22).max(1.0);
+                        let line = (d * 0.2).max(1.0);
                         self.push(y, d, Kind::Outline { x, w: d, radius: d / 2.0, line, color });
                     }
                     _ => self.rect(x, y, d, d, 0.0, color),
@@ -790,20 +810,21 @@ impl Layout {
                 let span = Span { text: format!("{n}."), ..Span::default() };
                 let buf = make_buffer(eng, &[span], &st, None);
                 let (w, h) = measure(&buf);
-                let x = self.x - 0.45 * em - w;
+                let x = self.x - 0.6 * em - w;
                 // Lines with CJK glyphs have a slightly lower baseline than
                 // Latin-only ones; follow the text's.
                 let shift = lead.zip(baseline(&buf)).map_or(0.0, |(text, number)| (text - number).round());
                 self.push(y + shift, h, Kind::Text { x, buf, color });
             }
+            // A quiet gray box: it reports a state, it is not a control.
             Marker::Task(checked) => {
-                let s = (0.95 * em).round();
-                let (x, y) = (self.x - 1.4 * em, y + ((line_h - s) / 2.0).round());
+                let s = (0.9 * em).round();
+                let (x, y) = ((self.x - 1.5 * em).round(), y + ((line_h - s) / 2.0).round());
                 if checked {
-                    self.rect(x, y, s, s, s * 0.22, self.theme.accent);
+                    self.rect(x, y, s, s, s * 0.22, self.theme.check);
                     self.push(y, s, Kind::Check { x });
                 } else {
-                    let (line, color) = ((s * 0.09).max(1.0).round(), self.theme.quote_bar);
+                    let (line, color) = ((s * 0.08).max(1.0).round(), self.theme.check);
                     self.push(y, s, Kind::Outline { x, w: s, radius: s * 0.22, line, color });
                 }
             }
@@ -823,32 +844,57 @@ impl Layout {
         }
         let em = self.em;
         let (st, mt, mb) = match self.heading {
+            // Headings stand out by size and the space above them, not by
+            // weight or rules; they sit close to the text they introduce.
             Some(level) => {
                 let level = level.clamp(1, 6);
                 let mut st = text_style((em * HEADING_SCALE[level - 1]).round(), HEADING_LINE);
-                st.weight = BOLD;
-                let top = if level <= 2 { 2.0 } else { 1.6 };
-                (st, top * em, 0.8 * em)
+                st.weight = if level <= 3 { MEDIUM } else { BOLD };
+                let top = if level <= 2 { 2.2 } else { 1.7 };
+                (st, top * em, 0.55 * em)
             }
-            None if tight => (text_style(em, BODY_LINE), 0.2 * em, 0.2 * em),
-            None => (text_style(em, BODY_LINE), 0.9 * em, 0.9 * em),
+            None if tight => (text_style(em, BODY_LINE), 0.32 * em, 0.32 * em),
+            None => (text_style(em, BODY_LINE), em, em),
         };
         let buf = make_buffer(eng, &spans, &st, Some(self.right - self.x));
         let (_, text_h) = measure(&buf);
-
-        // h1/h2 get a rule underneath, like GitHub.
-        let ruled = matches!(self.heading, Some(1 | 2));
-        let rule_gap = if ruled { (0.35 * em).round() } else { 0.0 };
-        let rule_h = if ruled { self.hairline() } else { 0.0 };
         self.lead = baseline(&buf);
-        let y = self.place(eng, text_h + rule_gap + rule_h, mt, mb, st.line_h);
+        let y = self.place(eng, text_h, mt, mb, st.line_h);
 
         self.code_boxes(&buf, self.x, y);
         let color = if self.heading == Some(6) { self.theme.dim } else { self.text_color() };
         self.push(y, text_h, Kind::Text { x: self.x, buf, color });
-        if ruled {
-            self.rect(self.x, y + text_h + rule_gap, self.right - self.x, rule_h, 0.0, self.theme.border);
+    }
+
+    /// YAML front matter, shown as a quiet key/value header above the
+    /// document.
+    fn front_matter(&mut self, eng: &mut Engine, text: &str) {
+        let rows = front_matter_rows(text);
+        if rows.is_empty() {
+            return;
         }
+
+        let em = self.em;
+        let key_st = label_style(em);
+        let value_st = TextStyle { face: Face::Ui, ..text_style((em * 0.95).round(), 1.5) };
+        let keys: Vec<Buffer> = rows
+            .iter()
+            .map(|(key, _)| make_buffer(eng, &[Span { text: key.clone(), ..Span::default() }], &key_st, None))
+            .collect();
+        let widest = keys.iter().map(|k| measure(k).0).fold(0.0, f32::max);
+        let key_col = (widest + 2.2 * em).max(4.5 * em).min((self.right - self.x) / 2.0).round();
+        for ((_, value), key) in rows.into_iter().zip(keys) {
+            let span = Span { text: value, ..Span::default() };
+            let value = make_buffer(eng, &[span], &value_st, Some(self.right - self.x - key_col));
+            let h = measure(&value).1.max(value_st.line_h);
+            let y = self.place(eng, h, 0.3 * em, 0.3 * em, value_st.line_h);
+            let shift = baseline(&value).zip(baseline(&key)).map_or(0.0, |(v, k)| (v - k).round());
+            self.push(y + shift, key_st.line_h, Kind::Text { x: self.x, buf: key, color: self.theme.dim });
+            self.push(y, h, Kind::Text { x: self.x + key_col, buf: value, color: self.theme.fg });
+        }
+        let line = self.hairline();
+        let y = self.place(eng, line, 1.1 * em, 1.2 * em, line);
+        self.rect(self.x, y, self.right - self.x, line, 0.0, self.theme.border);
     }
 
     /// Backgrounds behind the inline code of `buf`, whose top-left is at
@@ -885,10 +931,10 @@ impl Layout {
         // Never wait for the highlighter: show the block now and let
         // `Doc::highlight` color it once the tokens are there.
         match eng.highlighter.try_get(lang, text) {
-            Some(Some(tokens)) => self.mono_block(eng, &code_spans(&tokens, &self.theme), self.theme.fg),
-            Some(None) => self.mono_block(eng, &plain(), self.theme.fg),
+            Some(Some(tokens)) => self.mono_block(eng, &code_spans(&tokens, &self.theme), self.theme.fg, lang),
+            Some(None) => self.mono_block(eng, &plain(), self.theme.fg, lang),
             None => {
-                self.mono_block(eng, &plain(), self.theme.fg);
+                self.mono_block(eng, &plain(), self.theme.fg, lang);
                 let width = self.right - self.x - 2.0 * code_pad(self.em).0;
                 self.uncolored.push_back(Uncolored {
                     item: self.items.len() - 1,
@@ -906,12 +952,13 @@ impl Layout {
             return;
         }
         let span = Span { text: html.to_string(), ..Span::default() };
-        self.mono_block(eng, &[span], self.theme.dim);
+        self.mono_block(eng, &[span], self.theme.dim, "");
     }
 
-    /// A monospace block on a rounded background (code blocks, raw HTML).
-    /// Its text is the last item pushed.
-    fn mono_block(&mut self, eng: &mut Engine, spans: &[Span], fg: Rgba) {
+    /// A monospace block in a rounded frame (code blocks, raw HTML), with
+    /// `label` (the language) in its top right corner. Its text is the last
+    /// item pushed.
+    fn mono_block(&mut self, eng: &mut Engine, spans: &[Span], fg: Rgba, label: &str) {
         let em = self.em;
         let st = code_style(em);
         let (pad_x, pad_y) = code_pad(em);
@@ -921,7 +968,19 @@ impl Layout {
         let text_h = text_h.max(st.line_h);
         let h = text_h + 2.0 * pad_y;
         let y = self.place(eng, h, em, em, (em * BODY_LINE).round());
-        self.rect(self.x, y, width, h, (0.5 * em).round(), self.theme.code_bg);
+        let (line, radius) = (self.hairline(), (0.55 * em).round());
+        self.push(y, h, Kind::Outline { x: self.x, w: width, radius, line, color: self.theme.border });
+        if !label.is_empty() {
+            let span = Span { text: label.to_string(), ..Span::default() };
+            let tag = make_buffer(eng, &[span], &label_style(em), None);
+            let tag_w = measure(&tag).0;
+            // Left out when the first line of code reaches under it.
+            let first_line = buf.layout_runs().next().map_or(0.0, |run| run.line_w);
+            if first_line + em <= width - 2.0 * pad_x - tag_w {
+                let (x, y) = (self.right - pad_x - tag_w, y + (0.55 * em).round());
+                self.push(y, label_style(em).line_h, Kind::Text { x, buf: tag, color: self.theme.dim });
+            }
+        }
         self.push(y + pad_y, text_h, Kind::Text { x: self.x + pad_x, buf, color: fg });
     }
 
@@ -965,7 +1024,7 @@ impl Layout {
             return;
         }
         let em = self.em;
-        let (pad_x, pad_y, line) = ((0.9 * em).round(), (0.5 * em).round(), self.hairline());
+        let (pad_x, pad_y, line) = ((0.85 * em).round(), (0.55 * em).round(), self.hairline());
         let st = text_style(em, 1.5);
         let head_st = TextStyle { weight: BOLD, ..text_style(em, 1.5) };
 
@@ -1013,7 +1072,7 @@ impl Layout {
         let rows = heights.len() as f32;
         let table_w = widths.iter().sum::<f32>() + chrome;
         let table_h = heights.iter().sum::<f32>() + (rows + 1.0) * line;
-        let radius = (0.45 * em).round();
+        let radius = (0.5 * em).round();
         let y = self.place(eng, table_h, em, em, st.line_h);
         let head_h: f32 = heights[..table.head_rows].iter().sum::<f32>() + line;
         if table.head_rows > 0 {
@@ -1024,7 +1083,9 @@ impl Layout {
         let mut cy = y + line;
         for (r, row) in cells.into_iter().enumerate() {
             if r > 0 {
-                self.rect(self.x, cy - line, table_w, line, 0.0, self.theme.border);
+                // The rule under the header is twice as heavy.
+                let weight = if r == table.head_rows { 2.0 * line } else { line };
+                self.rect(self.x, cy - line, table_w, weight, 0.0, self.theme.border);
             }
             let mut cx = self.x;
             for (buf, width) in row.into_iter().zip(&widths) {
@@ -1037,6 +1098,36 @@ impl Layout {
         let outline = Kind::Outline { x: self.x, w: table_w, radius, line, color: self.theme.border };
         self.push(y, table_h, outline);
     }
+}
+
+/// The (label, value) rows of a YAML front matter block. Only top-level
+/// `key: value` lines are understood; anything else (nested mappings, list
+/// items) is kept as further lines of the value before it.
+fn front_matter_rows(text: &str) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let nested = line.starts_with([' ', '\t', '-', '#']);
+        match line.split_once(':') {
+            Some((key, value)) if !nested && !key.trim().is_empty() => {
+                let value = value.trim();
+                let quoted = |q: char| value.len() >= 2 && value.starts_with(q) && value.ends_with(q);
+                let value = if quoted('"') || quoted('\'') { &value[1..value.len() - 1] } else { value };
+                // "title" reads better as "Title" in a label.
+                let mut key: Vec<char> = key.trim().chars().collect();
+                key[0] = key[0].to_ascii_uppercase();
+                rows.push((key.into_iter().collect(), value.to_string()));
+            }
+            _ => {
+                if let Some((_, value)) = rows.last_mut() {
+                    if !value.is_empty() {
+                        value.push('\n');
+                    }
+                    value.push_str(line.trim());
+                }
+            }
+        }
+    }
+    rows
 }
 
 /// Column widths for a table whose columns would like `natural` widths but
@@ -1089,6 +1180,17 @@ struct Canvas<'a> {
     data: &'a mut [u8],
     w: i32,
     h: i32,
+    /// Maps glyph coverage to the opacity it is drawn with.
+    ink: &'a [u8; 256],
+}
+
+/// How much opacity a glyph pixel gets for its coverage. Dark text on a
+/// light background reads thinner than the same outlines in light on dark,
+/// and thin faces (a Song typeface at text size) nearly fall apart; text
+/// renderers compensate by thickening dark text a little, and so does this.
+fn ink(dark_page: bool) -> [u8; 256] {
+    let gamma = if dark_page { 1.0 } else { 0.72 };
+    std::array::from_fn(|coverage| ((coverage as f32 / 255.0).powf(gamma) * 255.0).round() as u8)
 }
 
 /// `x / 255`, rounded, for `x` up to 255 * 255.
@@ -1138,6 +1240,7 @@ impl Canvas<'_> {
     fn glyph(&mut self, x: i32, y: i32, img: &SwashImage, c: Rgba) {
         let (gw, gh) = (img.placement.width as i32, img.placement.height as i32);
         let Some((x0, y0, x1, y1)) = self.clip(x, y, gw, gh) else { return };
+        let ink = self.ink;
         for py in y0..y1 {
             let src = ((py - y) * gw + (x0 - x)) as usize;
             let dst = self.row(py, x0, x1).chunks_exact_mut(4);
@@ -1145,7 +1248,7 @@ impl Canvas<'_> {
                 SwashContent::Mask => {
                     for (px, &cov) in dst.zip(&img.data[src..]) {
                         if cov != 0 {
-                            Self::blend(px, c, cov as u32);
+                            Self::blend(px, c, ink[cov as usize] as u32);
                         }
                     }
                 }
@@ -1183,6 +1286,7 @@ impl Doc {
             pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
         }
 
+        let ink = ink(theme.dark);
         let (top, bottom) = (y0 as f32, (y0 + height) as f32);
         // How far outside its line box a glyph may paint.
         let slack = self.lay.em;
@@ -1216,15 +1320,15 @@ impl Doc {
                             line_join: tiny_skia::LineJoin::Round,
                             ..Stroke::default()
                         };
-                        pm.stroke_path(&path, &paint(Rgba(255, 255, 255, 255)), &stroke, shift, None);
+                        pm.stroke_path(&path, &paint(theme.check_mark), &stroke, shift, None);
                     }
                 }
                 Kind::Image { x, img } => {
-                    let mut canvas = Canvas { data: pm.data_mut(), w: w as i32, h: h as i32 };
+                    let mut canvas = Canvas { data: pm.data_mut(), w: w as i32, h: h as i32, ink: &ink };
                     canvas.image(x.round() as i32, (item.y - top).round() as i32, img);
                 }
                 Kind::Text { x, buf, color: default } => {
-                    let mut canvas = Canvas { data: pm.data_mut(), w: w as i32, h: h as i32 };
+                    let mut canvas = Canvas { data: pm.data_mut(), w: w as i32, h: h as i32, ink: &ink };
                     let (ox, oy) = (x.round() as i32, (item.y - top).round() as i32);
                     for run in buf.layout_runs() {
                         // Skip lines outside the strip: a long code block
@@ -1241,21 +1345,24 @@ impl Doc {
                                 canvas.glyph(gx, gy, img, c);
                             }
                         }
-                        // Strike through runs of glyphs marked for it.
-                        let mut glyphs = run.glyphs.iter().peekable();
-                        while let Some(g) = glyphs.next() {
-                            if g.metadata & META_STRIKE == 0 {
-                                continue;
+                        // Lines through or under runs of glyphs marked for it:
+                        // (flag, position above the baseline, thickness), in em.
+                        for (flag, rise, weight) in [(META_STRIKE, 0.3, 0.065), (META_LINK, -0.17, 0.05)] {
+                            let mut glyphs = run.glyphs.iter().peekable();
+                            while let Some(g) = glyphs.next() {
+                                if g.metadata & flag == 0 {
+                                    continue;
+                                }
+                                let (x0, mut x1) = (g.x, g.x + g.w);
+                                while let Some(next) = glyphs.next_if(|n| n.metadata & flag != 0) {
+                                    x1 = next.x + next.w;
+                                }
+                                let c = g.color_opt.map_or(*default, |c| Rgba(c.r(), c.g(), c.b(), c.a()));
+                                let thick = (g.font_size * weight).round().max(1.0);
+                                let y = (run.line_y - g.font_size * rise).round();
+                                let (x, w) = (ox + x0.round() as i32, (x1 - x0).round() as i32);
+                                canvas.fill(x, oy + y as i32, w, thick as i32, c);
                             }
-                            let (x0, mut x1) = (g.x, g.x + g.w);
-                            while let Some(next) = glyphs.next_if(|n| n.metadata & META_STRIKE != 0) {
-                                x1 = next.x + next.w;
-                            }
-                            let c = g.color_opt.map_or(*default, |c| Rgba(c.r(), c.g(), c.b(), c.a()));
-                            let thick = (g.font_size * 0.07).round().max(1.0);
-                            let y = (run.line_y - g.font_size * 0.3).round();
-                            let (x, w) = (ox + x0.round() as i32, (x1 - x0).round() as i32);
-                            canvas.fill(x, oy + y as i32, w, thick as i32, c);
                         }
                     }
                 }
@@ -1360,6 +1467,14 @@ mod tests {
         assert_eq!(script_runs("plain text"), vec![("plain text", false)]);
         assert_eq!(script_runs("  中文"), vec![("  中文", true)]);
         assert_eq!(script_runs(""), vec![]);
+    }
+
+    #[test]
+    fn reads_front_matter() {
+        let rows = front_matter_rows("title: \"Hello: world\"\ntags:\n  - a\n  - b\n\n作者: 某人\n# comment\n");
+        let expect = [("Title", "Hello: world"), ("Tags", "- a\n- b"), ("作者", "某人\n# comment")];
+        assert_eq!(rows, expect.map(|(k, v)| (k.to_string(), v.to_string())));
+        assert!(front_matter_rows("just some text\n").is_empty());
     }
 
     #[test]

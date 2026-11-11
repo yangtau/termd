@@ -58,16 +58,18 @@ environment.systemPackages = [ inputs.termd.packages.${pkgs.system}.default ];
 
 - `--theme auto|dark|light`：默认 `auto`，沿用终端的前景 / 背景色，页面背景透明。
   强制指定的明暗和终端实际背景相反时，才会画一块不透明的页面底色。
-- `--font NAME`、`--mono-font NAME`：指定正文和代码字体。默认用系统界面字体
-  （macOS 上是 SF + PingFang，Linux 上问 fontconfig），中文字体按 `LANG` 选简体 / 繁体 / 日文 / 韩文字形。
+- `--font NAME`、`--mono-font NAME`：指定正文和代码字体。正文默认用衬线字体
+  （macOS 上是 Charter + 宋体，Linux 上问 fontconfig），中文字体按 `LANG` 选简体 / 繁体 / 日文 / 韩文字形。
+- `--sans`：正文改用系统界面的无衬线字体（macOS 上是 SF + PingFang）。
 - `--zoom 1.2`：初始缩放。
 - `--no-smooth-scroll`：滚动时直接跳到目标位置，不做动画（比如通过很慢的 SSH 连接使用时）。
 - `--export out.png [--width 1200] [--font-size 16]`：不进入交互界面，直接把整页导出为 PNG。
 
 ## 支持的语法
 
-标题、段落、粗体 / 斜体 / 删除线、行内代码、链接（仅着色）、有序 / 无序 / 任务列表、引用、
-代码块（语法高亮）、表格（含对齐）、分隔线、本地图片（PNG / JPEG / GIF / WebP / BMP）。
+标题、段落、粗体 / 斜体 / 删除线、行内代码、链接（着色加下划线）、有序 / 无序 / 任务列表、引用、
+代码块（语法高亮）、表格（含对齐）、分隔线、本地图片（PNG / JPEG / GIF / WebP / BMP）、
+YAML front matter（显示为页首的属性表）。
 
 暂未支持：远程图片、数学公式、脚注、链接点击、文内搜索。
 
@@ -79,7 +81,7 @@ environment.systemPackages = [ inputs.termd.packages.${pkgs.system}.default ];
 - `src/doc.rs`：`pulldown-cmark` 解析，`cosmic-text` 排版，`tiny-skia` 画形状，字形直接贴到像素缓冲上。
   排版是增量的：只排到需要显示的位置就可以出图，剩下的在空闲时继续，所以打开一个很长的文档和打开一个短文档一样快。
   页面图像只覆盖正文那一栏而不是整个终端宽度，两侧的空白不需要传输。
-- `src/fonts.rs`：字体选择。从系统字体索引里只把选中的西文、等宽、中文字体交给排版引擎，
+- `src/fonts.rs`：字体选择。从系统字体索引里只把选中的正文、界面、等宽字体和它们各自搭配的中文字体交给排版引擎，
   并且每段文字都指定一个该字体确实存在的字重。这样既保证中文粗体不会被替换成别的字体，
   也避免了排版引擎为了找后备字体反复打开所有已安装的字体文件。文档里出现这些字体没有的字符（emoji、其他文字）时才按需补充。
 - `src/font_cache.rs`：系统字体索引的磁盘缓存。建立索引要打开机器上的每一个字体文件，字体多的时候（比如 macOS 上
@@ -88,6 +90,7 @@ environment.systemPackages = [ inputs.termd.packages.${pkgs.system}.default ];
   安装或删除字体后目录的修改时间会变，下次启动就自动重新扫描。删掉这个文件也可以强制重新扫描。
 - `src/highlight.rs`：`syntect` 语法高亮，在后台线程进行。某种语言第一次高亮要编译语法定义（shell 大约 45ms），
   比显示首屏需要的其他所有工作都慢，所以代码块先以纯色显示，高亮结果出来后再把颜色补上。
+  配色是自带的一套（注释、关键字、函数、字符串、数字、类型各一种颜色，明暗各一组），其余代码用正文颜色。
 - `src/main.rs`：查看器。每个分块只上传一次；滚动时只发送「显示某块的某个区域」的放置指令，不需要重新传图，
   所以可以每 8ms 发一帧来做平滑滚动。每帧最多光栅化一个新分块，视口附近的分块在空闲时预先上传。
 - `src/kitty.rs`：协议编码。终端和 termd 在同一台机器上并且支持时，像素通过 POSIX 共享内存传给终端

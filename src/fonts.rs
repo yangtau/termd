@@ -39,6 +39,24 @@ const SANS: &[&str] = &[
     "Arial",
 ];
 
+/// Body text. Charter is the closest thing macOS ships to a contemporary
+/// text serif and is a static font; the variable New York comes after it.
+const SERIF: &[&str] = &[
+    "Charter",
+    "Iowan Old Style",
+    "Georgia",
+    ".New York",
+    "New York",
+    "Palatino",
+    "Noto Serif",
+    "Source Serif 4",
+    "Source Serif Pro",
+    "Liberation Serif",
+    "DejaVu Serif",
+    "Times New Roman",
+    "Times",
+];
+
 const MONO: &[&str] = &[
     "SF Mono",
     ".SF NS Mono",
@@ -99,6 +117,27 @@ const CJK_KO: &[&str] = &[
     "NanumGothic",
 ];
 
+const SERIF_SC: &[&str] = &[
+    "Songti SC",
+    "STSong",
+    "Source Han Serif SC",
+    "Source Han Serif CN",
+    "Noto Serif CJK SC",
+    "Noto Serif SC",
+    "SimSun",
+];
+const SERIF_TC: &[&str] = &["Songti TC", "Source Han Serif TC", "Noto Serif CJK TC", "Noto Serif TC", "PMingLiU"];
+const SERIF_JA: &[&str] = &[
+    "Hiragino Mincho ProN",
+    "Source Han Serif",
+    "Source Han Serif JP",
+    "Noto Serif CJK JP",
+    "Noto Serif JP",
+    "IPAMincho",
+];
+const SERIF_KO: &[&str] =
+    &["AppleMyungjo", "Source Han Serif K", "Noto Serif CJK KR", "Noto Serif KR", "NanumMyeongjo"];
+
 /// Tried first, in this order, for characters the main families lack.
 const EXTRA: &[&str] = &[
     "Apple Color Emoji",
@@ -116,6 +155,7 @@ const EXTRA: &[&str] = &[
 ];
 
 /// A font family and the weights it can render.
+#[derive(Clone)]
 pub struct Family {
     pub name: String,
     /// Weights of the upright static faces, ascending.
@@ -140,11 +180,35 @@ impl Family {
     }
 }
 
+/// What a piece of text is set in.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Face {
+    /// Running text and headings: a serif, unless the user chose otherwise.
+    Body,
+    /// Labels around the text (front matter, the language of a code block).
+    Ui,
+    Mono,
+}
+
+/// What the user asked for on the command line.
+#[derive(Default)]
+pub struct Choice<'a> {
+    /// Family for body text.
+    pub body: Option<&'a str>,
+    /// Family for code.
+    pub mono: Option<&'a str>,
+    /// Set body text in the sans-serif UI font instead of a serif.
+    pub sans: bool,
+}
+
 pub struct Fonts {
-    pub sans: Family,
-    pub mono: Family,
-    /// Used for CJK characters in both body text and code.
-    pub cjk: Option<Family>,
+    body: Family,
+    /// CJK companion of `body` (a Song/Mincho face next to a serif).
+    body_cjk: Option<Family>,
+    ui: Family,
+    /// CJK companion of `ui`, also used inside code.
+    ui_cjk: Option<Family>,
+    mono: Family,
     /// Every installed face; only metadata, the files are not kept open.
     all: Database,
     /// Families already copied into the `FontSystem`.
@@ -173,16 +237,17 @@ impl Installed {
 /// terminal is being probed.
 pub fn scan() -> Installed {
     let start = std::time::Instant::now();
-    let lang = cjk_lang().1;
+    let lang = cjk_lang().lang;
     if let Some(index) = font_cache::load(lang) {
         return Installed { index, took: start.elapsed(), cached: true };
     }
 
     // On Linux and the BSDs fontconfig knows which fonts the user prefers.
     // The three questions run as concurrent processes while we scan.
-    let cjk_pattern = format!("sans-serif:lang={lang}");
-    // The first two are asked for English text: they are used for non-CJK runs.
-    let asked = ["sans-serif:lang=en", "monospace:lang=en", &cjk_pattern].map(|pattern| {
+    let (cjk_sans, cjk_serif) = (format!("sans-serif:lang={lang}"), format!("serif:lang={lang}"));
+    // The Latin ones are asked for English text: they are used for non-CJK runs.
+    let patterns = ["sans-serif:lang=en", "monospace:lang=en", &cjk_sans, "serif:lang=en", &cjk_serif];
+    let asked = patterns.map(|pattern| {
         if cfg!(target_os = "macos") {
             return None;
         }
@@ -221,11 +286,25 @@ fn has_name(face: &FaceInfo, name: &str) -> bool {
     face.families.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
 }
 
-/// The CJK family list and fontconfig language for the user's locale. Han
-/// characters are drawn differently per region and the right font cannot be
-/// told from the text alone, so the locale decides; Simplified Chinese is
-/// the default.
-fn cjk_lang() -> (&'static [&'static str], &'static str) {
+/// CJK families for one region, and the fontconfig language to ask for.
+struct Cjk {
+    sans: &'static [&'static str],
+    serif: &'static [&'static str],
+    lang: &'static str,
+}
+
+const CJK: [Cjk; 5] = [
+    Cjk { sans: CJK_SC, serif: SERIF_SC, lang: "zh-cn" },
+    Cjk { sans: CJK_TC, serif: SERIF_TC, lang: "zh-tw" },
+    Cjk { sans: CJK_HK, serif: SERIF_TC, lang: "zh-hk" },
+    Cjk { sans: CJK_JA, serif: SERIF_JA, lang: "ja" },
+    Cjk { sans: CJK_KO, serif: SERIF_KO, lang: "ko" },
+];
+
+/// The CJK region of the user's locale. Han characters are drawn
+/// differently per region and the right font cannot be told from the text
+/// alone, so the locale decides; Simplified Chinese is the default.
+fn cjk_lang() -> &'static Cjk {
     let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
         .filter_map(|k| std::env::var(k).ok())
@@ -233,34 +312,36 @@ fn cjk_lang() -> (&'static [&'static str], &'static str) {
         .unwrap_or_default()
         .to_ascii_lowercase()
         .replace('-', "_");
-    if locale.starts_with("ja") {
-        (CJK_JA, "ja")
+    let region = if locale.starts_with("ja") {
+        3
     } else if locale.starts_with("ko") {
-        (CJK_KO, "ko")
+        4
     } else if locale.starts_with("zh_hk") || locale.starts_with("zh_mo") {
-        (CJK_HK, "zh-hk")
+        2
     } else if locale.starts_with("zh_tw") || locale.starts_with("zh_hant") {
-        (CJK_TC, "zh-tw")
+        1
     } else {
-        (CJK_SC, "zh-cn")
-    }
+        0
+    };
+    &CJK[region]
 }
 
-/// CJK families to try, best first.
-fn cjk_candidates() -> Vec<&'static str> {
-    let first = cjk_lang().0;
-    let mut list = first.to_vec();
-    for more in [CJK_SC, CJK_TC, CJK_HK, CJK_JA, CJK_KO] {
-        list.extend(more.iter().filter(|n| !first.contains(n)));
+/// CJK families to try, the user's region first; `serif` selects the
+/// Song/Mincho lists.
+fn cjk_candidates(serif: bool) -> Vec<&'static str> {
+    let list = |cjk: &Cjk| if serif { cjk.serif } else { cjk.sans };
+    let first = list(cjk_lang());
+    let mut names = first.to_vec();
+    for more in CJK.iter().map(list) {
+        names.extend(more.iter().filter(|n| !names.contains(n)).collect::<Vec<_>>());
     }
-    list
+    names
 }
 
 impl Fonts {
     /// Choose the families and build a `FontSystem` that knows only them.
-    /// `sans` / `mono` are the user's explicit choices.
-    pub fn new(installed: Installed, sans: Option<&str>, mono: Option<&str>) -> (FontSystem, Fonts) {
-        let Index { db: all, defaults: [fc_sans, fc_mono, fc_cjk] } = installed.index;
+    pub fn new(installed: Installed, choice: &Choice) -> (FontSystem, Fonts) {
+        let Index { db: all, defaults: [fc_sans, fc_mono, fc_cjk, fc_serif, fc_cjk_serif] } = installed.index;
         // Explicit choice, then the system's configured default, then the
         // first installed family of our own list.
         let pick = |explicit: Option<&str>, configured: &Option<String>, list: &[&str]| {
@@ -271,32 +352,68 @@ impl Fonts {
                 .find_map(|name| family(&all, name))
         };
         let unknown = |name: &str| Family { name: name.into(), weights: vec![], variable: None };
-        let sans = pick(sans, &fc_sans, SANS)
-            .or_else(|| any_family(&all, false))
-            .unwrap_or_else(|| unknown("sans-serif"));
-        let mono = pick(mono, &fc_mono, MONO)
-            .or_else(|| any_family(&all, true))
-            .unwrap_or_else(|| unknown("monospace"));
         // fontconfig answers with its default font when nothing supports the
-        // language, so its CJK answer only counts if the font has Han glyphs.
-        let fc_cjk = fc_cjk.filter(|name| {
+        // language, so its CJK answers only count if the font has Han glyphs.
+        let has_han = |name: &String| {
             let mut probe = vec!['中'];
             uncovered(&all, name, &mut probe);
             probe.is_empty()
-        });
-        let cjk = pick(None, &fc_cjk, &cjk_candidates());
+        };
+
+        let ui = pick(None, &fc_sans, SANS)
+            .or_else(|| any_family(&all, false))
+            .unwrap_or_else(|| unknown("sans-serif"));
+        let ui_cjk = pick(None, &fc_cjk.filter(has_han), &cjk_candidates(false));
+        let mono = pick(choice.mono, &fc_mono, MONO)
+            .or_else(|| any_family(&all, true))
+            .unwrap_or_else(|| unknown("monospace"));
+        let (serif, serif_cjk) = match choice.sans {
+            true => (None, None),
+            false => (pick(None, &fc_serif, SERIF), pick(None, &fc_cjk_serif.filter(has_han), &cjk_candidates(true))),
+        };
+        let body = choice.body.and_then(|name| family(&all, name)).or(serif).unwrap_or_else(|| ui.clone());
+        let body_cjk = serif_cjk.or_else(|| ui_cjk.clone());
 
         let mut db = Database::new();
         let mut loaded = Vec::new();
-        for fam in [Some(&sans), Some(&mono), cjk.as_ref()].into_iter().flatten() {
-            copy_family(&all, &mut db, &fam.name, &mut loaded);
+        for fam in [Some(&body), body_cjk.as_ref(), Some(&ui), ui_cjk.as_ref(), Some(&mono)].into_iter().flatten() {
+            if !loaded.contains(&fam.name) {
+                copy_family(&all, &mut db, &fam.name, &mut loaded);
+            }
         }
-        db.set_sans_serif_family(sans.name.clone());
+        db.set_sans_serif_family(ui.name.clone());
+        db.set_serif_family(body.name.clone());
         db.set_monospace_family(mono.name.clone());
 
         let locale = "en-US".to_string(); // only used by cosmic-text's own fallback lists
         let fs = FontSystem::new_with_locale_and_db_and_fallback(locale, db, PlatformFallback);
-        (fs, Fonts { sans, mono, cjk, all, loaded, checked: HashSet::new() })
+        (fs, Fonts { body, body_cjk, ui, ui_cjk, mono, all, loaded, checked: HashSet::new() })
+    }
+
+    /// The family for text in `face`; `cjk` for its CJK characters.
+    pub fn family(&self, face: Face, cjk: bool) -> &Family {
+        let (latin, han) = match face {
+            Face::Body => (&self.body, &self.body_cjk),
+            Face::Ui => (&self.ui, &self.ui_cjk),
+            Face::Mono => (&self.mono, &self.ui_cjk),
+        };
+        match (cjk, han) {
+            (true, Some(han)) => han,
+            _ => latin,
+        }
+    }
+
+    /// The families in use, for `TERMD_DEBUG`.
+    pub fn names(&self) -> String {
+        let name = |f: &Option<Family>| f.as_ref().map_or("none".to_string(), |f| format!("{:?}", f.name));
+        format!(
+            "body={:?}+{} ui={:?}+{} mono={:?}",
+            self.body.name,
+            name(&self.body_cjk),
+            self.ui.name,
+            name(&self.ui_cjk),
+            self.mono.name
+        )
     }
 
     /// Make sure every character of `text` can be drawn, copying additional
@@ -319,7 +436,7 @@ impl Fonts {
         }
 
         // Preferred extras first, then everything else that is installed.
-        let mut names: Vec<String> = EXTRA.iter().chain(cjk_candidates().iter()).map(|s| s.to_string()).collect();
+        let mut names: Vec<String> = EXTRA.iter().chain(&cjk_candidates(false)).map(|s| s.to_string()).collect();
         let mut rest: Vec<&FaceInfo> = self.all.faces().collect();
         rest.sort_by_key(|f| (f.style != Style::Normal, f.weight.0.abs_diff(400), f.monospaced));
         names.extend(rest.iter().filter_map(|f| f.families.first()).map(|(n, _)| n.clone()));

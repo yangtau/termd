@@ -11,8 +11,8 @@
 //! The file is plain text, one record per line with tab-separated fields:
 //!
 //! ```text
-//! termd-fonts 1 <lang>
-//! D <sans> <mono> <cjk>                 system default families ("" = none)
+//! termd-fonts 2 <lang>
+//! D <family>...                         system default families ("" = none)
 //! W <mtime> <path>                      a watched path ("-" = missing)
 //! F <index> <weight> <style> <stretch> <mono> <path> <postscript> <family>...
 //! ```
@@ -23,13 +23,13 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-const HEADER: &str = "termd-fonts 1";
+const HEADER: &str = "termd-fonts 2";
 
 /// A font index: every installed face, and the system's default families
-/// (sans, monospace, CJK) where there is a way to ask.
+/// (sans, monospace, CJK sans, serif, CJK serif) where there is a way to ask.
 pub struct Index {
     pub db: Database,
-    pub defaults: [Option<String>; 3],
+    pub defaults: [Option<String>; 5],
 }
 
 fn cache_file() -> Option<PathBuf> {
@@ -108,11 +108,12 @@ fn encode(index: &Index, lang: &str, watched: &BTreeSet<PathBuf>) -> Option<Stri
     // occur inside a field; give up on caching if one does.
     let clean = |s: &str| (!s.contains(['\t', '\n', '\r'])).then_some(());
     let mut out = format!("{HEADER}\t{lang}\n");
-    let [sans, mono, cjk] = index.defaults.each_ref().map(|d| d.as_deref().unwrap_or(""));
-    for name in [sans, mono, cjk] {
+    out.push('D');
+    for name in index.defaults.each_ref().map(|d| d.as_deref().unwrap_or("")) {
         clean(name)?;
+        let _ = write!(out, "\t{name}");
     }
-    let _ = writeln!(out, "D\t{sans}\t{mono}\t{cjk}");
+    out.push('\n');
     for path in watched {
         let path_str = path.to_str()?;
         clean(path_str)?;
@@ -148,12 +149,14 @@ fn decode(text: &str, lang: &str, current: impl Fn(&str, &str) -> bool) -> Optio
         return None;
     }
     let mut db = Database::new();
-    let mut defaults = [None, None, None];
+    let mut defaults = [const { None }; 5];
     for line in lines {
         let fields: Vec<&str> = line.split('\t').collect();
         match fields.as_slice() {
-            ["D", sans, mono, cjk] => {
-                defaults = [sans, mono, cjk].map(|name| (!name.is_empty()).then(|| name.to_string()));
+            ["D", names @ ..] if names.len() == defaults.len() => {
+                for (default, name) in defaults.iter_mut().zip(names) {
+                    *default = (!name.is_empty()).then(|| name.to_string());
+                }
             }
             ["W", stamp, path] => {
                 if !current(path, stamp) {
@@ -238,7 +241,8 @@ mod tests {
         let mut db = Database::new();
         db.push_face_info(face("/fonts/PingFang.ttc", 3, &["PingFang SC", "苹方-简"], 600, Style::Normal, false));
         db.push_face_info(face("/fonts/sub dir/Menlo.ttc", 1, &["Menlo"], 400, Style::Italic, true));
-        Index { db, defaults: [Some("Inter".into()), None, Some("Noto Sans CJK SC".into())] }
+        let defaults = [Some("Inter".into()), None, Some("Noto Sans CJK SC".into()), None, Some("Songti SC".into())];
+        Index { db, defaults }
     }
 
     fn summary(index: &Index) -> Vec<String> {
@@ -276,7 +280,7 @@ mod tests {
         // Asked for another language's defaults.
         assert!(decode(&text, "ja", |_, _| true).is_none());
         // Another format version, or garbage.
-        assert!(decode(&text.replace("termd-fonts 1", "termd-fonts 0"), "zh-cn", |_, _| true).is_none());
+        assert!(decode(&text.replace("termd-fonts 2", "termd-fonts 1"), "zh-cn", |_, _| true).is_none());
         assert!(decode(&format!("{text}X\tunknown record\n"), "zh-cn", |_, _| true).is_none());
         assert!(decode("", "zh-cn", |_, _| true).is_none());
     }

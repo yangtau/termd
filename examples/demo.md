@@ -1,5 +1,6 @@
 ---
-title: front matter is skipped
+title: termd 演示文档
+note: YAML front matter 显示为页首的属性表
 ---
 
 # termd 演示文档

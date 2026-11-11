@@ -47,13 +47,17 @@ struct Cli {
     #[arg(long, default_value_t = 1.0)]
     zoom: f32,
 
-    /// Font family for body text (default: the system UI font)
+    /// Font family for body text (default: a serif text face)
     #[arg(long)]
     font: Option<String>,
 
     /// Font family for code (default: the system monospace font)
     #[arg(long)]
     mono_font: Option<String>,
+
+    /// Set body text in the sans-serif system UI font instead of a serif
+    #[arg(long)]
+    sans: bool,
 
     /// Jump instead of animating when scrolling (e.g. over a slow connection)
     #[arg(long)]
@@ -121,7 +125,8 @@ fn main() -> Result<()> {
         let took = installed.took.as_secs_f64() * 1e3;
         let how = if installed.cached { "read from cache" } else { "scanned" };
         trace.note(format!("font index joined: {} faces, {how} in {took:.1}ms", installed.faces()));
-        let engine = Engine::new(installed, highlighter, cli.font.as_deref(), cli.mono_font.as_deref());
+        let choice = fonts::Choice { body: cli.font.as_deref(), mono: cli.mono_font.as_deref(), sans: cli.sans };
+        let engine = Engine::new(installed, highlighter, &choice);
         trace.note(format!("fonts ready: {}", engine.font_names()));
         Ok(engine)
     };

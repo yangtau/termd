@@ -40,14 +40,20 @@ pub struct Theme {
     /// terminal's real background.
     pub page: Option<Rgb>,
     pub fg: Rgba,
+    /// Secondary text: labels, struck-through text, raw HTML.
     pub dim: Rgba,
+    /// Text inside block quotes.
+    pub quote: Rgba,
     pub link: Rgba,
+    /// Background of inline code.
     pub code_bg: Rgba,
+    /// Rules, table lines and the frame of code blocks.
     pub border: Rgba,
     pub quote_bar: Rgba,
     pub table_head: Rgba,
-    /// Checked task boxes.
-    pub accent: Rgba,
+    /// Fill of a checked task box, and the check mark drawn on it.
+    pub check: Rgba,
+    pub check_mark: Rgba,
 }
 
 const DARK_BG: Rgb = Rgb(0x0d, 0x11, 0x17);
@@ -98,13 +104,15 @@ impl Theme {
             dark,
             page,
             fg: fg.opaque(),
-            dim: tint(0.62),
+            dim: tint(0.58),
+            quote: tint(0.8),
             link: link.opaque(),
-            code_bg: tint(if dark { 0.09 } else { 0.06 }),
-            border: tint(0.17),
-            quote_bar: tint(0.28),
-            table_head: tint(if dark { 0.06 } else { 0.04 }),
-            accent: link.opaque(),
+            code_bg: tint(if dark { 0.1 } else { 0.065 }),
+            border: tint(if dark { 0.2 } else { 0.14 }),
+            quote_bar: tint(0.38),
+            table_head: tint(if dark { 0.07 } else { 0.05 }),
+            check: tint(0.34),
+            check_mark: behind.unwrap_or(if dark { DARK_BG } else { LIGHT_BG }).opaque(),
         }
     }
 }
@@ -120,7 +128,7 @@ mod tests {
         assert_eq!(t.page, None);
         assert_eq!(t.fg, Rgba(205, 214, 244, 255));
         // Tints are opaque mixes of the terminal's two colors.
-        assert_eq!(t.code_bg, Rgb(30, 30, 46).mix(Rgb(205, 214, 244), 0.09).opaque());
+        assert_eq!(t.code_bg, Rgb(30, 30, 46).mix(Rgb(205, 214, 244), 0.1).opaque());
     }
 
     #[test]
@@ -140,6 +148,6 @@ mod tests {
         assert!(t.dark);
         assert_eq!(t.page, None);
         // Unknown background: tints fall back to translucency.
-        assert_eq!(t.code_bg.3, 23);
+        assert_eq!(t.code_bg.3, 26);
     }
 }

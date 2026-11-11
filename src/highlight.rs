@@ -14,7 +14,10 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, OnceLock};
-use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter as Colorizer, Theme, ThemeSet};
+use syntect::highlighting::{
+    Color, HighlightIterator, HighlightState, Highlighter as Colorizer, ScopeSelectors, StyleModifier, Theme,
+    ThemeItem, ThemeSettings,
+};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
@@ -61,9 +64,54 @@ fn key(lang: &str, code: &str) -> u64 {
     h.finish()
 }
 
-fn syntaxes() -> &'static (SyntaxSet, ThemeSet) {
-    static LOADED: OnceLock<(SyntaxSet, ThemeSet)> = OnceLock::new();
-    LOADED.get_or_init(|| (SyntaxSet::load_defaults_newlines(), ThemeSet::load_defaults()))
+/// What "the default text color" looks like in our themes: a color no rule
+/// uses, so tokens that no rule matched can be told apart.
+const PLAIN: Color = Color { r: 1, g: 2, b: 3, a: 255 };
+
+/// A small highlighting theme: a handful of colors for the kinds of token
+/// that matter when reading code, everything else in the text color.
+/// `colors` are comment, keyword, function, string, number, type.
+fn theme(colors: [u32; 6]) -> Theme {
+    let [comment, keyword, function, string, number, kind] = colors.map(|rgb| {
+        let [_, r, g, b] = rgb.to_be_bytes();
+        Color { r, g, b, a: 255 }
+    });
+    let rules = [
+        ("comment, punctuation.definition.comment", comment),
+        ("keyword, storage, variable.language", keyword),
+        ("keyword.operator", PLAIN),
+        ("keyword.operator.word, keyword.operator.new, keyword.operator.logical.python", keyword),
+        ("entity.name.function, support.function, support.macro, variable.function, entity.name.tag", function),
+        ("string, punctuation.definition.string", string),
+        ("constant.numeric, constant.language, constant.character, support.constant", number),
+        ("entity.other.attribute-name, constant.other, variable.other.constant", number),
+        ("entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, entity.name.trait", kind),
+        ("support.type, support.class, entity.other.inherited-class, entity.name.namespace", kind),
+        ("markup.inserted", string),
+        ("markup.deleted", keyword),
+        ("markup.heading, entity.name.section", function),
+    ];
+    Theme {
+        settings: ThemeSettings { foreground: Some(PLAIN), ..ThemeSettings::default() },
+        scopes: rules
+            .into_iter()
+            .filter_map(|(scopes, color)| {
+                let style = StyleModifier { foreground: Some(color), background: None, font_style: None };
+                Some(ThemeItem { scope: scopes.parse::<ScopeSelectors>().ok()?, style })
+            })
+            .collect(),
+        ..Theme::default()
+    }
+}
+
+/// The syntax definitions and our themes for a dark and a light page.
+fn syntaxes() -> &'static (SyntaxSet, [Theme; 2]) {
+    static LOADED: OnceLock<(SyntaxSet, [Theme; 2])> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        let dark = theme([0x7f8694, 0xc79bf2, 0x7fb0f5, 0x93cf8d, 0x5fc9c4, 0xe2bd7a]);
+        let light = theme([0x8a8f98, 0x8431c4, 0x0b5cc7, 0x17803d, 0x0a7f89, 0x9a5b00]);
+        (SyntaxSet::load_defaults_newlines(), [dark, light])
+    })
 }
 
 impl Highlighter {
@@ -153,8 +201,7 @@ impl Highlighter {
 fn highlight(lang: &str, code: &str) -> Option<Tokens> {
     let (set, themes) = syntaxes();
     let syntax = set.find_syntax_by_token(lang)?;
-    let themes: [&Theme; 2] = [&themes.themes["base16-ocean.dark"], &themes.themes["InspiredGitHub"]];
-    let colorizers = themes.map(Colorizer::new);
+    let colorizers = themes.each_ref().map(Colorizer::new);
     let mut states = [0, 1].map(|i| HighlightState::new(&colorizers[i], ScopeStack::new()));
     let mut parser = ParseState::new(syntax);
 
@@ -168,10 +215,9 @@ fn highlight(lang: &str, code: &str) -> Option<Tokens> {
         let [dark, light] = [0, 1].map(|i| {
             HighlightIterator::new(&mut states[i], &ops, line, &colorizers[i])
                 .map(|(style, text)| {
-                    // The theme's default color means "ordinary text", which
-                    // the page draws in its own text color.
+                    // Ordinary text is drawn in the page's own text color.
                     let c = style.foreground;
-                    (text, (Some(c) != themes[i].settings.foreground).then_some(Rgb(c.r, c.g, c.b)))
+                    (text, (c != PLAIN).then_some(Rgb(c.r, c.g, c.b)))
                 })
                 .collect::<Vec<_>>()
         });
