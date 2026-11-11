@@ -78,6 +78,9 @@ environment.systemPackages = [ (inputs.termd.lib.mkTermd pkgs "0.1.0") ];
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
+也可以不打标签，直接在 GitHub 的 Actions → Release → Run workflow 里填写版本号（如 `0.1.0`），
+工作流会在所选分支的最新提交上创建 `v0.1.0` 标签和 Release。
+
 `.github/workflows/release.yml` 会构建 `aarch64-apple-darwin` 和 `x86_64-unknown-linux-musl`
 两个二进制，上传到对应的 GitHub Release（附 `SHA256SUMS`），再把各平台的哈希写进默认分支的
 `nix/releases.json`。flake 就是根据这个文件下载对应版本的 release 的。
