@@ -124,10 +124,14 @@ fn main() -> Result<()> {
     if let Some(out) = &cli.export {
         let mut engine = engine(&mut trace)?;
         let theme = Theme::opaque(cli.theme.dark().unwrap_or(true));
-        let page_w = cli.width.clamp(200, 8000);
-        let bg = theme.page.expect("export theme is opaque");
-        let opts = LayoutOpts { page_w, font_px: cli.font_size * zoom, base_dir: base_dir(&cli.file), theme };
-        let page = Doc::new(&mut engine, &source, opts).render_page(&mut engine, page_w, bg);
+        let opts = LayoutOpts {
+            page_w: cli.width.clamp(200, 8000),
+            font_px: cli.font_size * zoom,
+            base_dir: base_dir(&cli.file),
+            theme,
+            scroll_tables: false,
+        };
+        let page = Doc::new(&mut engine, &source, opts).render_page(&mut engine).context("page too large to export")?;
         page.save(out).with_context(|| format!("writing {}", out.display()))?;
         return Ok(());
     }

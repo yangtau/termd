@@ -145,30 +145,38 @@ fn transmit_inline(out: &mut Vec<u8>, id: u32, width: u32, height: u32, rgba: &[
 /// Where and which part of an uploaded image to show.
 pub struct Placement {
     pub id: u32,
+    /// Which of the image's placements this is; an image can be shown in
+    /// several places at once.
+    pub placement: u32,
     /// Terminal cell of the top-left corner, 1-based.
     pub row: u32,
     pub col: u32,
     /// Pixel offset inside that cell.
     pub x_off: u32,
     pub y_off: u32,
-    /// First source row and number of rows to show.
+    /// Top-left corner of the part of the image to show, and its size.
+    pub src_x: u32,
     pub src_y: u32,
     pub width: u32,
     pub height: u32,
+    /// Stacking order among images.
+    pub z: i32,
 }
 
-/// Show part of an image. Re-placing an image moves it in place.
+/// Show part of an image. Placing the same placement again moves it.
 pub fn place(out: &mut Vec<u8>, p: &Placement) {
-    let Placement { id, row, col, x_off, y_off, src_y, width, height } = *p;
+    let Placement { id, placement, row, col, x_off, y_off, src_x, src_y, width, height, z } = *p;
     let _ = write!(
         out,
-        "\x1b[{row};{col}H\x1b_Ga=p,q=2,C=1,i={id},p=1,x=0,y={src_y},w={width},h={height},X={x_off},Y={y_off}\x1b\\"
+        "\x1b[{row};{col}H\x1b_Ga=p,q=2,C=1,i={id},p={placement},x={src_x},y={src_y},w={width},h={height},\
+         X={x_off},Y={y_off},z={z}\x1b\\"
     );
 }
 
-/// Hide image `id` but keep its pixels in the terminal.
-pub fn unplace(out: &mut Vec<u8>, id: u32) {
-    let _ = write!(out, "\x1b_Ga=d,d=i,q=2,i={id}\x1b\\");
+/// Take placement `placement` of image `id` off the screen, keeping the
+/// image's pixels in the terminal.
+pub fn unplace(out: &mut Vec<u8>, id: u32, placement: u32) {
+    let _ = write!(out, "\x1b_Ga=d,d=i,q=2,i={id},p={placement}\x1b\\");
 }
 
 /// Hide image `id` and free its pixels.

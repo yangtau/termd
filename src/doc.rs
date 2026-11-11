@@ -69,12 +69,16 @@ pub struct LayoutOpts {
     /// Directory relative image paths are resolved against.
     pub base_dir: PathBuf,
     pub theme: Theme,
+    /// Whether a table too wide for the page may keep its width and scroll
+    /// sideways (the viewer), or has to wrap until it fits (a PNG).
+    pub scroll_tables: bool,
 }
 
 pub struct Doc {
-    /// Width of the page image in pixels.
+    /// Width in pixels of the strip of the page that holds the text column;
+    /// only tables may reach outside of it.
     pub width: u32,
-    /// Where the left edge of the image sits on the page.
+    /// Where on the page that strip starts.
     pub origin_x: u32,
     /// Height laid out so far; final once `done()`.
     height: u32,
@@ -145,7 +149,29 @@ pub struct Hit {
 struct Item {
     y: f32,
     h: f32,
+    /// 0 for the page itself, else the number (from 1) of the sideways
+    /// scrolling table it is part of, which is drawn as an image of its own.
+    layer: u16,
     kind: Kind,
+}
+
+/// A table on the page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TableBox {
+    /// Its place on the page: left edge, top, the width that shows, height.
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Its full width; more than `w` if it scrolls sideways.
+    pub full_w: f32,
+    /// How far it is scrolled sideways.
+    pub scroll: f32,
+    /// Height of its header rows (0 without a header), which stay at the
+    /// top of the viewport while the rest of the table scrolls through.
+    pub head_h: f32,
+    /// The layer its items are drawn on: not 0 if it scrolls sideways.
+    pub layer: u16,
 }
 
 /// What makes a text item part of the document's content (as opposed to
@@ -410,6 +436,10 @@ struct Layout {
     theme: Theme,
     base_dir: PathBuf,
     em: f32,
+    /// Width of the whole page; tables may use it when the column is too
+    /// narrow for them.
+    page_w: f32,
+    scroll_tables: bool,
     /// Left edge of the current block (moves right inside lists and quotes).
     x: f32,
     right: f32,
@@ -430,6 +460,9 @@ struct Layout {
     /// Destinations of the links seen so far; text refers to them by index.
     links: Vec<String>,
     codes: Vec<CodeBlock>,
+    tables: Vec<TableBox>,
+    /// The layer new items go on (see `Item::layer`).
+    layer: u16,
     /// Headings as (anchor name, page offset), for links into the document.
     headings: Vec<(String, f32)>,
     /// Code blocks waiting for their colors, in document order.
@@ -555,8 +588,10 @@ impl Doc {
                 theme: opts.theme,
                 base_dir: opts.base_dir,
                 em,
-                x: bleed,
-                right: bleed + content_w,
+                page_w,
+                scroll_tables: opts.scroll_tables,
+                x: origin_x + bleed,
+                right: origin_x + bleed + content_w,
                 y: top,
                 margin: 0.0,
                 first: true,
@@ -567,6 +602,8 @@ impl Doc {
                 items: Vec::new(),
                 links: Vec::new(),
                 codes: Vec::new(),
+                tables: Vec::new(),
+                layer: 0,
                 headings: Vec::new(),
                 uncolored: VecDeque::new(),
                 spans: Vec::new(),
@@ -745,7 +782,46 @@ impl Doc {
         self.lines.start_of(line)
     }
 
-    /// What is at the point (`x`, `y`) of the page image.
+    /// The tables laid out so far.
+    pub fn tables(&self) -> &[TableBox] {
+        &self.lay.tables
+    }
+
+    /// Scroll table number `table` sideways by `by` pixels, as far as it
+    /// goes. Returns whether it moved.
+    pub fn scroll_table(&mut self, table: usize, by: f32) -> bool {
+        let Some(t) = self.lay.tables.get_mut(table) else { return false };
+        let to = (t.scroll + by).clamp(0.0, (t.full_w - t.w).max(0.0)).round();
+        let moved = to != t.scroll;
+        t.scroll = to;
+        moved
+    }
+
+    /// The strip of the page that has something to draw between page
+    /// offsets `top` and `bottom`, as (left edge, width): the text column,
+    /// widened by tables that reach out of it.
+    pub fn extent(&self, top: u32, bottom: u32) -> (u32, u32) {
+        let (mut left, mut right) = (self.origin_x as f32, (self.origin_x + self.width) as f32);
+        for t in self.lay.tables.iter().filter(|t| t.layer == 0) {
+            if t.y < bottom as f32 && t.y + t.h > top as f32 {
+                (left, right) = (left.min(t.x.floor()), right.max((t.x + t.w).ceil()));
+            }
+        }
+        let left = left.max(0.0);
+        (left as u32, (right.min(self.lay.page_w) - left).max(1.0) as u32)
+    }
+
+    /// Where page coordinate `x` is for an item on `layer`: a sideways
+    /// scrolled table shows a later part of itself. The flag tells whether
+    /// `x` is in the part of the page where that layer shows at all.
+    fn local_x(&self, layer: u16, x: f32) -> (f32, bool) {
+        match layer.checked_sub(1).and_then(|i| self.lay.tables.get(i as usize)) {
+            Some(t) => (x.clamp(t.x, t.x + t.w) + t.scroll, x >= t.x && x < t.x + t.w),
+            None => (x, true),
+        }
+    }
+
+    /// What is at the point (`x`, `y`) of the page.
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
         // The nearest text, vertically first: text beside the point on its
         // line wins over text right above or below it.
@@ -753,11 +829,13 @@ impl Doc {
         let (index, item, item_x, buf, content) = self.texts().min_by(|a, b| {
             let key = |(_, item, left, buf, _): &(usize, &Item, f32, &Buffer, &Content)| {
                 let width = buf.size().0.unwrap_or(0.0);
+                let x = self.local_x(item.layer, x).0;
                 (distance(item.y, item.y + item.h, y), distance(*left, left + width, x))
             };
             let (ka, kb) = (key(a), key(b));
             ka.0.total_cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
         })?;
+        let (x, in_view) = self.local_x(item.layer, x);
         let (lx, ly) = (x - item_x, y - item.y);
         // The line at that height, or the nearest one.
         let run = buf
@@ -788,7 +866,7 @@ impl Doc {
             item: index as u32,
             offset: line_start + in_line as u32,
             character: line_start + character as u32,
-            inside: on_line && under.is_some(),
+            inside: on_line && in_view && under.is_some(),
             link,
         })
     }
@@ -819,13 +897,21 @@ impl Doc {
                     let (lo, hi) = extent.unwrap_or((g.x, g.x + g.w));
                     Some((lo.min(g.x), hi.max(g.x + g.w)))
                 });
-                match extent {
-                    Some((lo, hi)) => rects.push([x + lo, line_top, hi - lo, run.line_height]),
+                let (lo, hi) = match extent {
+                    Some((lo, hi)) => (x + lo, x + hi),
                     // An empty line inside the selection still shows.
                     None if run.glyphs.is_empty() && line_start >= start && line_start < end => {
-                        rects.push([x, line_top, (0.4 * self.lay.em).round(), run.line_height]);
+                        (x, x + (0.4 * self.lay.em).round())
                     }
-                    None => {}
+                    None => continue,
+                };
+                // What a sideways scrolled table shows of it.
+                let (lo, hi) = match item.layer.checked_sub(1).and_then(|i| self.lay.tables.get(i as usize)) {
+                    Some(t) => ((lo - t.scroll).max(t.x), (hi - t.scroll).min(t.x + t.w)),
+                    None => (lo, hi),
+                };
+                if lo < hi {
+                    rects.push([lo, line_top, hi - lo, run.line_height]);
                 }
             }
         }
@@ -1214,7 +1300,7 @@ impl Layout {
 
     /// Add a shape or a piece of decoration.
     fn push(&mut self, y: f32, h: f32, kind: Kind) {
-        self.items.push(Item { y, h, kind });
+        self.items.push(Item { y, h, layer: self.layer, kind });
     }
 
     /// Add text that is document content; `map` says where it comes from.
@@ -1222,7 +1308,7 @@ impl Layout {
     fn push_text(&mut self, x: f32, y: f32, h: f32, buf: Buffer, color: Rgba, map: TextMap, join: Join) {
         self.covered = self.covered.max(map.range().end);
         let content = content(&buf, map, join, std::mem::take(&mut self.prefix));
-        self.items.push(Item { y, h, kind: Kind::Text { x, buf, color, content } });
+        self.items.push(Item { y, h, layer: self.layer, kind: Kind::Text { x, buf, color, content } });
     }
 
     /// Add text that is decoration: a list number, a label.
@@ -1521,24 +1607,48 @@ impl Layout {
         let st = text_style(em, 1.5);
         let head_st = TextStyle { weight: BOLD, ..text_style(em, 1.5) };
 
-        // Pass 1: natural (unwrapped) width of every column.
+        // Pass 1: for every column, the width its content would like
+        // (nothing wrapped) and the least it can do with (its longest word).
         let mut cells: Vec<Vec<(Buffer, TextMap)>> = Vec::new();
         let mut natural = vec![0.0f32; cols];
+        let mut least = vec![0.0f32; cols];
         for (r, row) in table.rows.iter().enumerate() {
             let style = if r < table.head_rows { &head_st } else { &st };
             let mut bufs = Vec::new();
             for (c, spans) in row.iter().enumerate() {
                 let buf = make_buffer(eng, spans, style, None);
                 natural[c] = natural[c].max(measure(&buf).0.ceil() + 1.0);
+                least[c] = least[c].max(longest_word(&buf).ceil() + 1.0);
                 bufs.push((buf, span_map(spans)));
             }
             cells.push(bufs);
         }
+        // A column is not squeezed below a few characters even if its
+        // words are shorter, nor of course made wider than it wants.
+        for (least, natural) in least.iter_mut().zip(&natural) {
+            *least = least.max(5.0 * em).min(*natural);
+        }
 
-        let avail = self.right - self.x;
+        // How wide may it be? A table that does not fit the text column
+        // first grows out of it, up to the page; then its cells wrap; and
+        // if it would still not fit with every column at its least, it
+        // keeps a comfortable width and scrolls sideways. Inside a list or
+        // a quote it stays in its place.
         let chrome = cols as f32 * 2.0 * pad_x;
-        let room = (avail - chrome).max(cols as f32 * em);
-        let widths = fit_columns(&natural, room, em);
+        let column = self.right - self.x;
+        let nested = !self.lists.is_empty() || !self.quotes.is_empty();
+        let margin = (1.2 * em).round();
+        let page = if nested { column } else { (self.page_w - 2.0 * margin).max(column) };
+        let wanted = natural.iter().sum::<f32>() + chrome;
+        let scrolls = self.scroll_tables && least.iter().sum::<f32>() + chrome > page;
+        let widths = if wanted <= page {
+            natural
+        } else if scrolls {
+            let comfortable = 14.0 * em;
+            natural.iter().zip(&least).map(|(n, l)| n.min(l.max(comfortable))).collect()
+        } else {
+            fit_columns(&natural, &least, page - chrome)
+        };
 
         // Pass 2: wrap to the final widths and measure row heights.
         let mut heights = Vec::new();
@@ -1568,9 +1678,29 @@ impl Layout {
         let radius = (0.5 * em).round();
         let y = self.place(eng, table_h, em, em, st.line_h);
         let head_h: f32 = heights[..table.head_rows].iter().sum::<f32>() + line;
+        // In the column if it fits there, else centered on the page. (Where
+        // tables cannot scroll, one that is still too wide is cut off.)
+        let shown_w = if scrolls { table_w.min(page) } else { table_w };
+        let x = match nested || shown_w <= column {
+            true => self.x,
+            false => ((self.page_w - shown_w.min(page)) / 2.0).round(),
+        };
+        let number = self.tables.len() as u16 + 1;
+        self.layer = if table_w > shown_w { number } else { 0 };
+        self.tables.push(TableBox {
+            x,
+            y,
+            w: shown_w,
+            h: table_h,
+            full_w: table_w,
+            scroll: 0.0,
+            head_h: if table.head_rows > 0 { head_h + line } else { 0.0 },
+            layer: self.layer,
+        });
+
         if table.head_rows > 0 {
             let radii = [radius, radius, 0.0, 0.0];
-            self.push(y, head_h, Kind::Rect { x: self.x, w: table_w, radii, color: self.theme.table_head });
+            self.push(y, head_h, Kind::Rect { x, w: table_w, radii, color: self.theme.table_head });
         }
         let color = self.text_color();
         let mut cy = y + line;
@@ -1578,9 +1708,9 @@ impl Layout {
             if r > 0 {
                 // The rule under the header is twice as heavy.
                 let weight = if r == table.head_rows { 2.0 * line } else { line };
-                self.rect(self.x, cy - line, table_w, weight, 0.0, self.theme.border);
+                self.rect(x, cy - line, table_w, weight, 0.0, self.theme.border);
             }
-            let mut cx = self.x;
+            let mut cx = x;
             for (c, ((buf, map), width)) in row.into_iter().zip(&widths).enumerate() {
                 self.code_boxes(&buf, cx + pad_x, cy + pad_y);
                 let join = match (r, c) {
@@ -1593,9 +1723,32 @@ impl Layout {
             }
             cy += heights[r] + line;
         }
-        let outline = Kind::Outline { x: self.x, w: table_w, radius, line, color: self.theme.border };
+        let outline = Kind::Outline { x, w: table_w, radius, line, color: self.theme.border };
         self.push(y, table_h, outline);
+        self.layer = 0;
     }
+}
+
+/// Width of the longest stretch of an unwrapped buffer that cannot be
+/// broken: a word, or a single CJK character.
+fn longest_word(buf: &Buffer) -> f32 {
+    let mut longest = 0.0f32;
+    for run in buf.layout_runs() {
+        let mut word = 0.0;
+        for g in run.glyphs {
+            let c = run.text[g.start..].chars().next().unwrap_or(' ');
+            if c.is_whitespace() {
+                word = 0.0;
+            } else if is_cjk(c) {
+                longest = longest.max(g.w);
+                word = 0.0;
+            } else {
+                word += g.w;
+                longest = longest.max(word);
+            }
+        }
+    }
+    longest
 }
 
 /// The text in a buffer, as it would be typed.
@@ -1659,30 +1812,18 @@ fn front_matter_rows(text: &str) -> Vec<(String, String)> {
     rows
 }
 
-/// Column widths for a table whose columns would like `natural` widths but
-/// only have `room` in total. Columns narrower than an equal share keep
-/// their width, so a short column is never squeezed because of a long one;
-/// the others share what is left in proportion to their content.
-fn fit_columns(natural: &[f32], room: f32, min: f32) -> Vec<f32> {
-    let mut widths = natural.to_vec();
-    let mut flexible: Vec<usize> = (0..natural.len()).collect();
-    let mut room = room;
-    loop {
-        let wanted: f32 = flexible.iter().map(|&c| natural[c]).sum();
-        if wanted <= room || flexible.is_empty() {
-            return widths;
-        }
-        let share = room / flexible.len() as f32;
-        let (fits, wide): (Vec<usize>, Vec<usize>) = flexible.iter().partition(|&&c| natural[c] <= share);
-        if fits.is_empty() {
-            for c in wide {
-                widths[c] = (natural[c] * room / wanted).floor().max(min);
-            }
-            return widths;
-        }
-        room -= fits.iter().map(|&c| natural[c]).sum::<f32>();
-        flexible = wide;
+/// Column widths for a table whose columns would like `natural` widths,
+/// need at least `least`, and have `room` in total. If everything fits,
+/// every column gets what it wants; otherwise each gives up the same share
+/// of what it can spare, so a column of short words keeps its width and
+/// the long-winded ones wrap.
+fn fit_columns(natural: &[f32], least: &[f32], room: f32) -> Vec<f32> {
+    let (wanted, needed): (f32, f32) = (natural.iter().sum(), least.iter().sum());
+    if wanted <= room {
+        return natural.to_vec();
     }
+    let spare = ((room - needed) / (wanted - needed).max(1.0)).clamp(0.0, 1.0);
+    natural.iter().zip(least).map(|(n, l)| (l + (n - l) * spare).floor()).collect()
 }
 
 fn load_image<'a>(
@@ -1806,9 +1947,12 @@ impl Canvas<'_> {
 }
 
 impl Doc {
-    /// Rasterize the strip `[y0, y0 + height)` of the page as straight RGBA.
-    pub fn render(&self, eng: &mut Engine, y0: u32, height: u32) -> Vec<u8> {
-        let (w, h) = (self.width.max(1), height.max(1));
+    /// Rasterize a rectangle of the page as straight RGBA: `width` pixels
+    /// from `x0`, `height` from `y0`. `layer` 0 is the page; layer `n` is
+    /// sideways scrolling table number `n`, whose image starts at the
+    /// table's left edge and is as wide as the whole table.
+    pub fn render(&self, eng: &mut Engine, layer: u16, x0: u32, y0: u32, width: u32, height: u32) -> Vec<u8> {
+        let (w, h) = (width.max(1), height.max(1));
         let mut pm = Pixmap::new(w, h).expect("non-zero pixmap size");
         let theme = &self.lay.theme;
         if let Some(bg) = theme.page {
@@ -1819,9 +1963,10 @@ impl Doc {
         let (top, bottom) = (y0 as f32, (y0 + height) as f32);
         // How far outside its line box a glyph may paint.
         let slack = self.lay.em;
-        let shift = Transform::from_translate(0.0, -top);
+        let shift = Transform::from_translate(-(x0 as f32), -top);
+        let left = x0 as i32;
         for item in &self.lay.items {
-            if item.y - slack >= bottom || item.y + item.h + slack <= top {
+            if item.layer != layer || item.y - slack >= bottom || item.y + item.h + slack <= top {
                 continue;
             }
             match &item.kind {
@@ -1884,11 +2029,11 @@ impl Doc {
                 }
                 Kind::Image { x, img } => {
                     let mut canvas = Canvas { data: pm.data_mut(), w: w as i32, h: h as i32, ink: &ink };
-                    canvas.image(x.round() as i32, (item.y - top).round() as i32, img);
+                    canvas.image(x.round() as i32 - left, (item.y - top).round() as i32, img);
                 }
                 Kind::Text { x, buf, color: default, .. } => {
                     let mut canvas = Canvas { data: pm.data_mut(), w: w as i32, h: h as i32, ink: &ink };
-                    let (ox, oy) = (x.round() as i32, (item.y - top).round() as i32);
+                    let (ox, oy) = (x.round() as i32 - left, (item.y - top).round() as i32);
                     for run in buf.layout_runs() {
                         // Skip lines outside the strip: a long code block
                         // spans many tiles but each needs only a few lines.
@@ -1935,21 +2080,12 @@ impl Doc {
         data
     }
 
-    /// Render the whole document onto an opaque page `page_w` pixels wide,
-    /// for PNG export.
-    pub fn render_page(&mut self, eng: &mut Engine, page_w: u32, bg: Rgb) -> RgbaImage {
+    /// Render the whole document as one image of the page, for PNG export.
+    pub fn render_page(&mut self, eng: &mut Engine) -> Option<RgbaImage> {
         self.advance(eng, None, None);
         self.highlight(eng, None);
-        let (w, h) = (self.width, self.height.max(1));
-        let strip = self.render(eng, 0, h);
-        let page_w = page_w.max(w);
-        let mut page = RgbaImage::from_pixel(page_w, h, image::Rgba([bg.0, bg.1, bg.2, 255]));
-        let x0 = ((page_w - w) / 2) as usize;
-        for (y, row) in strip.chunks_exact(w as usize * 4).enumerate() {
-            let start = (y * page_w as usize + x0) * 4;
-            page.as_mut()[start..start + row.len()].copy_from_slice(row);
-        }
-        page
+        let (w, h) = (self.lay.page_w as u32, self.height.max(1));
+        RgbaImage::from_raw(w, h, self.render(eng, 0, 0, 0, w, h))
     }
 }
 
@@ -2028,7 +2164,7 @@ mod tests {
 
     fn layout(eng: &mut Engine, markdown: &str, page_w: u32) -> Doc {
         let theme = Theme::new(Some(Rgb(255, 255, 255)), Some(Rgb(0, 0, 0)), None);
-        let opts = LayoutOpts { page_w, font_px: 16.0, base_dir: PathBuf::from("."), theme };
+        let opts = LayoutOpts { page_w, font_px: 16.0, base_dir: PathBuf::from("."), theme, scroll_tables: true };
         let mut doc = Doc::new(eng, markdown, opts);
         doc.advance(eng, None, None);
         doc
@@ -2269,6 +2405,99 @@ Last &amp; final paragraph.
         assert_eq!(doc.selected_text(from, to), "Hello wide_world, 中文 end.");
     }
 
+    /// A table with `cols` columns of `words` words each.
+    fn table(cols: usize, words: usize) -> String {
+        let cell = |c: usize| (0..words).map(|w| format!("word{c}x{w}")).collect::<Vec<_>>().join(" ");
+        let row = |_| format!("| {} |", (0..cols).map(cell).collect::<Vec<_>>().join(" | "));
+        let rule = format!("|{}", "---|".repeat(cols));
+        format!("intro\n\n{}\n{rule}\n{}\n{}\n\noutro\n", row(0), row(1), row(2))
+    }
+
+    #[test]
+    fn tables_grow_out_of_the_column_then_wrap_then_scroll() {
+        let Some(mut eng) = engine() else { return };
+        // The column is 46 em = 736 px of a 1600 px page.
+        let column = |doc: &Doc| (doc.origin_x as f32, (doc.origin_x + doc.width) as f32);
+
+        // Small: stays in the column, at its left edge.
+        let doc = layout(&mut eng, &table(3, 1), 1600);
+        let (left, right) = column(&doc);
+        let t = doc.tables()[0];
+        assert!(t.x > left && t.x + t.w < right && t.layer == 0 && t.full_w == t.w, "{t:?}");
+        assert_eq!(doc.extent(0, doc.height()), (doc.origin_x, doc.width));
+
+        // Wider than the column, narrower than the page: keeps its natural
+        // width (one line per row) and is centered on the page.
+        let doc = layout(&mut eng, &table(4, 4), 1600);
+        let (left, right) = column(&doc);
+        let t = doc.tables()[0];
+        assert!(t.x < left && t.x + t.w > right && t.w < 1600.0 && t.layer == 0, "{t:?}");
+        assert!(((t.x + t.w / 2.0) - 800.0).abs() <= 1.0, "centered: {t:?}");
+        assert!(t.h < 150.0, "rows of one line: {t:?}");
+        // The page is drawn wider where the table is, and only there.
+        let (x, w) = doc.extent(t.y as u32, (t.y + t.h) as u32);
+        assert!(x as f32 <= t.x && (x + w) as f32 >= t.x + t.w);
+        assert_eq!(doc.extent(0, t.y as u32 - 1), (doc.origin_x, doc.width));
+
+        // Too wide for the page: fills it, and the cells wrap.
+        let doc = layout(&mut eng, &table(4, 14), 1600);
+        let t = doc.tables()[0];
+        assert!(t.w > 1400.0 && t.w <= 1600.0 && t.layer == 0 && t.full_w == t.w, "{t:?}");
+        assert!(t.h > 150.0, "wrapped rows: {t:?}");
+
+        // Too many columns even when wrapped: scrolls sideways.
+        let doc = layout(&mut eng, &table(30, 3), 1600);
+        let t = doc.tables()[0];
+        assert!(t.layer == 1 && t.full_w > t.w && t.w <= 1600.0, "{t:?}");
+
+        // Inside a list a table stays where it is: it wraps or scrolls
+        // within the column.
+        let nested = format!("- item\n\n  {}", table(4, 4).replace('\n', "\n  "));
+        let doc = layout(&mut eng, &nested, 1600);
+        let (left, right) = column(&doc);
+        let t = doc.tables()[0];
+        assert!(t.x > left && t.x + t.w <= right + 1.0, "{t:?}");
+    }
+
+    #[test]
+    fn a_png_has_no_scrolling_tables() {
+        let Some(mut eng) = engine() else { return };
+        let theme = Theme::opaque(false);
+        let opts = LayoutOpts { page_w: 800, font_px: 16.0, base_dir: PathBuf::from("."), theme, scroll_tables: false };
+        let mut doc = Doc::new(&mut eng, &table(30, 3), opts);
+        let page = doc.render_page(&mut eng).unwrap();
+        assert_eq!((page.width(), page.height()), (800, doc.height()));
+        assert_eq!(doc.tables()[0].layer, 0);
+    }
+
+    #[test]
+    fn scrolled_tables_are_hit_where_they_show() {
+        let Some(mut eng) = engine() else { return };
+        let mut doc = layout(&mut eng, &table(30, 3), 1600);
+        let t = doc.tables()[0];
+        // The last column is out of sight until the table is scrolled.
+        let (x, y) = find(&doc, "word29x0");
+        assert!(x > t.x + t.w);
+        assert!(doc.scroll_table(0, 1e9));
+        let scroll = doc.tables()[0].scroll;
+        assert_eq!(scroll, (t.full_w - t.w).round());
+        assert!(!doc.scroll_table(0, 10.0), "already at the end");
+        // On the page it is now `scroll` further left.
+        let hit = doc.hit(x - scroll, y).unwrap();
+        assert!(hit.inside);
+        let (from, to) = doc.word_at(hit.character());
+        assert_eq!(doc.selected_text(from, to), "word29x0");
+        // Its highlight is drawn where it shows, cut off at the table's edge.
+        let rects = doc.selection_rects(from, to, 0.0, doc.height() as f32);
+        assert_eq!(rects.len(), 1);
+        assert!((rects[0][0] - (x - scroll)).abs() < 12.0 && rects[0][0] + rects[0][2] <= t.x + t.w + 0.5);
+        // The first column is out of sight now: nothing of it is highlighted.
+        let (from, to) = doc.block_at(before(&doc, "word0x0"));
+        assert!(doc.selection_rects(from, to, 0.0, doc.height() as f32).is_empty());
+        // Beside the table, at the height of its rows, nothing is "inside".
+        assert!(!doc.hit(t.x - 5.0, y).unwrap().inside);
+    }
+
     #[test]
     fn code_blocks_can_be_copied() {
         let Some(mut eng) = engine() else { return };
@@ -2288,7 +2517,8 @@ Last &amp; final paragraph.
     fn headings_can_be_linked_to() {
         let Some(mut eng) = engine() else { return };
         let theme = Theme::new(None, None, None);
-        let opts = LayoutOpts { page_w: 900, font_px: 16.0, base_dir: PathBuf::from("."), theme };
+        let opts =
+            LayoutOpts { page_w: 900, font_px: 16.0, base_dir: PathBuf::from("."), theme, scroll_tables: true };
         let text = format!("# Top\n\n{}\n## Far Below\n\ntext\n\n## Far Below\n", "paragraph\n\n".repeat(80));
         let mut doc = Doc::new(&mut eng, &text, opts);
         doc.advance(&mut eng, Some(100), None);
@@ -2311,13 +2541,14 @@ Last &amp; final paragraph.
     #[test]
     fn short_columns_keep_their_width() {
         // Everything fits: untouched.
-        assert_eq!(fit_columns(&[40.0, 60.0], 200.0, 10.0), vec![40.0, 60.0]);
+        assert_eq!(fit_columns(&[40.0, 60.0], &[40.0, 30.0], 200.0), vec![40.0, 60.0]);
         // One long column: only it shrinks.
-        assert_eq!(fit_columns(&[40.0, 50.0, 900.0], 400.0, 10.0), vec![40.0, 50.0, 310.0]);
-        // Two long columns share the rest in proportion.
-        assert_eq!(fit_columns(&[40.0, 600.0, 300.0], 400.0, 10.0), vec![40.0, 240.0, 120.0]);
-        // Nothing fits an equal share: all shrink in proportion, down to the minimum.
-        assert_eq!(fit_columns(&[300.0, 100.0], 40.0, 16.0), vec![30.0, 16.0]);
+        assert_eq!(fit_columns(&[40.0, 50.0, 900.0], &[40.0, 50.0, 80.0], 400.0), vec![40.0, 50.0, 310.0]);
+        // Two long columns give up the same share of what they can spare.
+        assert_eq!(fit_columns(&[40.0, 600.0, 300.0], &[40.0, 100.0, 100.0], 440.0), vec![40.0, 242.0, 157.0]);
+        assert_eq!(fit_columns(&[40.0, 600.0, 300.0], &[40.0, 100.0, 100.0], 590.0), vec![40.0, 350.0, 200.0]);
+        // Not even the least fits: the least it is (and the table scrolls or is cut).
+        assert_eq!(fit_columns(&[300.0, 100.0], &[80.0, 60.0], 40.0), vec![80.0, 60.0]);
     }
 
     #[test]

@@ -1,14 +1,14 @@
 //! The interactive viewer: shows the page through the terminal's image
 //! protocol and reacts to keys, the mouse and changes of the file.
 
-use crate::doc::{Doc, Engine, LayoutOpts, Pos};
+use crate::doc::{Doc, Engine, LayoutOpts, Pos, TableBox};
 use crate::theme::Theme;
 use crate::term::Probe;
 use crate::{Cli, Trace, base_dir, kitty, modified, open, read_source};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::{cursor, execute, terminal};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +18,10 @@ use std::time::{Duration, Instant, SystemTime};
 const TILE_H: u32 = 512;
 /// Uploaded tiles further than this from the viewport are freed.
 const KEEP_TILES: u32 = 16;
+/// Image ids from here on are the tiles of sideways scrolling tables, a
+/// block of ids per table; page tiles count up from 1.
+const TABLE_ID: u32 = 0x2000_0000;
+const TABLE_IDS: u32 = 4096;
 /// Interval between frames of a scroll animation.
 const FRAME: Duration = Duration::from_millis(8);
 /// Time constant of the scroll animation: each frame covers a fixed fraction
@@ -129,6 +133,63 @@ impl Geometry {
     }
 }
 
+/// An image in the terminal: tile number `index` (512 pixels of height
+/// each) of the page, or of a sideways scrolling table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Tile {
+    /// 0 for the page, else the table's number (see `doc::TableBox::layer`).
+    layer: u16,
+    index: u32,
+}
+
+impl Tile {
+    fn page(index: u32) -> Tile {
+        Tile { layer: 0, index }
+    }
+
+    fn id(self) -> u32 {
+        match self.layer {
+            0 => self.index + 1,
+            table => TABLE_ID + (table as u32 - 1) * TABLE_IDS + self.index % TABLE_IDS,
+        }
+    }
+}
+
+/// The part of its layer that an uploaded tile shows. A tile with nothing
+/// in it (past the end of the page) has no height.
+#[derive(Clone, Copy)]
+struct Area {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+/// What a frame has put on the screen so far.
+#[derive(Default)]
+struct Frame {
+    out: Vec<u8>,
+    /// A tile was rendered for this frame; further ones wait for the next.
+    rendered: bool,
+    /// The placements (tile, which placement of it) made.
+    placed: BTreeSet<(Tile, u32)>,
+}
+
+/// Rows of a layer to put on the screen.
+struct Show {
+    layer: u16,
+    /// Page rows, from and to.
+    rows: (u32, u32),
+    /// Screen row for the first of them; rows that end up above the
+    /// screen or below the page area are cut off.
+    at: i64,
+    /// The columns to show, as (left edge in the layer, width, left edge
+    /// on the screen); all the tile has if `None`.
+    crop: Option<(u32, u32, u32)>,
+    placement: u32,
+    z: i32,
+}
+
 /// What the mouse pointer is over.
 #[derive(Clone, Copy, PartialEq)]
 enum Hover {
@@ -155,10 +216,10 @@ pub struct Viewer {
     target: f64,
     /// When the running scroll animation last advanced.
     animated_at: Option<Instant>,
-    /// Tiles whose pixels are in the terminal.
-    sent: BTreeSet<u32>,
-    /// Tiles currently displayed.
-    placed: BTreeSet<u32>,
+    /// Tiles whose pixels are in the terminal, and what they show.
+    sent: BTreeMap<Tile, Area>,
+    /// The placements currently on screen.
+    placed: BTreeSet<(Tile, u32)>,
     /// The layout was rebuilt: the terminal's tiles are stale.
     fresh: bool,
     /// The last frame left part of the viewport for the next one.
@@ -226,7 +287,7 @@ impl Viewer {
             scroll: 0.0,
             target: 0.0,
             animated_at: None,
-            sent: BTreeSet::new(),
+            sent: BTreeMap::new(),
             placed: BTreeSet::new(),
             fresh: true,
             unfinished: false,
@@ -290,7 +351,7 @@ impl Viewer {
                 }
                 if let Some(tile) = self.prefetch_target() {
                     let mut out = Vec::new();
-                    self.send_tile(tile, &mut out);
+                    self.send_tile(Tile::page(tile), &mut out);
                     write_all(&out)?;
                     continue;
                 }
@@ -361,6 +422,8 @@ impl Viewer {
                     KeyCode::Char('u') => -page / 2.0,
                     KeyCode::Char(' ') | KeyCode::Char('f') | KeyCode::PageDown => page - line,
                     KeyCode::Char('b') | KeyCode::PageUp => -(page - line),
+                    KeyCode::Char('h') | KeyCode::Left => return Ok(self.scroll_table(-8.0)),
+                    KeyCode::Char('l') | KeyCode::Right => return Ok(self.scroll_table(8.0)),
                     KeyCode::Char('g') | KeyCode::Home => f64::NEG_INFINITY,
                     KeyCode::Char('G') | KeyCode::End => f64::INFINITY,
                     KeyCode::Char('+') | KeyCode::Char('=') => return Ok(self.set_zoom(self.zoom * 1.1)),
@@ -383,7 +446,13 @@ impl Viewer {
             }
             Event::Mouse(m) => {
                 let at = self.screen_point(m.column, m.row);
+                self.pointer = at;
+                let sideways = m.modifiers.contains(KeyModifiers::SHIFT);
                 match m.kind {
+                    MouseEventKind::ScrollLeft => return Ok(self.scroll_table(-4.0)),
+                    MouseEventKind::ScrollRight => return Ok(self.scroll_table(4.0)),
+                    MouseEventKind::ScrollUp if sideways => return Ok(self.scroll_table(-4.0)),
+                    MouseEventKind::ScrollDown if sideways => return Ok(self.scroll_table(4.0)),
                     MouseEventKind::ScrollDown => line,
                     MouseEventKind::ScrollUp => -line,
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -455,11 +524,11 @@ impl Viewer {
         }
     }
 
-    /// The point of the page image at screen position `at`, unless that is
-    /// on the status bar.
+    /// The point of the page at screen position `at`, unless that is on the
+    /// status bar.
     fn page_point(&self, at: (f64, f64)) -> Option<(f32, f32)> {
         let on_page = at.1 < self.geom.view_h() as f64;
-        on_page.then_some(((at.0 - self.doc.origin_x as f64) as f32, (at.1 + self.scroll) as f32))
+        on_page.then_some((at.0 as f32, (at.1 + self.scroll) as f32))
     }
 
     /// The selection in reading order, if any text is selected.
@@ -640,15 +709,33 @@ impl Viewer {
         self.copy_code(after_last.unwrap_or(first), fenced)
     }
 
+    /// Scroll a table sideways by `cells` character cells: the one under
+    /// the pointer if that scrolls, else the first one in view that does.
+    fn scroll_table(&mut self, cells: f64) -> Action {
+        let scroll = self.scroll.round() as u32;
+        let (x, y) = (self.pointer.0 as f32, self.pointer.1 as f32 + scroll as f32);
+        let under = |t: &TableBox| x >= t.x && x < t.x + t.w && y >= t.y && y < t.y + t.h;
+        let table = self
+            .scrolling_tables(scroll)
+            .find(|(_, t)| under(t))
+            .or_else(|| self.scrolling_tables(scroll).next())
+            .map(|(index, _)| index);
+        let by = (cells * self.geom.cell_w as f64) as f32;
+        match table.is_some_and(|table| self.doc.scroll_table(table, by)) {
+            true => Action::Redraw,
+            false => Action::None,
+        }
+    }
+
     /// Color code blocks whose highlighting has arrived. Their tiles are
     /// rendered again; returns whether any of them is on screen.
     fn apply_highlights(&mut self) -> bool {
         let mut visible = false;
         let deadline = Instant::now() + WORK_SLICE;
         for (top, bottom) in self.doc.highlight(&mut self.engine, Some(deadline)) {
-            for tile in top / TILE_H..=bottom.saturating_sub(1) / TILE_H {
+            for tile in (top / TILE_H..=bottom.saturating_sub(1) / TILE_H).map(Tile::page) {
                 self.sent.remove(&tile);
-                visible |= self.placed.contains(&tile);
+                visible |= self.placed.contains(&(tile, 1));
             }
         }
         visible
@@ -770,8 +857,8 @@ impl Viewer {
         (scroll / TILE_H, end.saturating_sub(1) / TILE_H)
     }
 
-    /// The next tile worth uploading ahead of time: the nearest missing one
-    /// within a screen of where the viewport is or is heading.
+    /// The next page tile worth uploading ahead of time: the nearest
+    /// missing one within a screen of where the viewport is or is heading.
     fn prefetch_target(&self) -> Option<u32> {
         let (a, b) = (self.scroll.min(self.target) as u32, self.scroll.max(self.target) as u32);
         let (first, last) = (self.visible_tiles(a).0, self.visible_tiles(b).1);
@@ -781,7 +868,7 @@ impl Viewer {
             false => u32::MAX, // more page may follow; `send_tile` lays it out
         };
         let going_up = self.target < self.scroll;
-        let missing = |t: u32| t < count && !self.sent.contains(&t);
+        let missing = |t: u32| t < count && !self.sent.contains_key(&Tile::page(t));
         (first..=last).find(|&t| missing(t)).or_else(|| {
             (1..=reach)
                 .flat_map(|d| match going_up {
@@ -793,27 +880,137 @@ impl Viewer {
         })
     }
 
-    /// Render tile `tile` and queue its upload. A tile is only uploaded once
-    /// the layout below it is final, so it never has to be sent again.
-    fn send_tile(&mut self, tile: u32, out: &mut Vec<u8>) {
-        let top = tile * TILE_H;
-        self.doc.advance(&mut self.engine, Some(top + TILE_H), None);
-        self.sent.insert(tile); // even if empty, so it is not retried
-        if top >= self.doc.height() {
+    /// What `tile` shows of its layer.
+    fn area(&self, tile: Tile) -> Option<Area> {
+        match tile.layer.checked_sub(1) {
+            None => {
+                let y = tile.index * TILE_H;
+                let h = TILE_H.min(self.doc.height().checked_sub(y).filter(|&left| left > 0)?);
+                let (x, w) = self.doc.extent(y, y + h);
+                Some(Area { x, y, w, h })
+            }
+            // A table's image starts at its top left corner and is as wide
+            // as all of it.
+            Some(table) => {
+                let t = self.doc.tables().get(table as usize)?;
+                let (top, bottom) = (t.y.floor() as u32, (t.y + t.h).ceil() as u32);
+                let y = top + tile.index * TILE_H;
+                let h = TILE_H.min(bottom.checked_sub(y).filter(|&left| left > 0)?);
+                Some(Area { x: t.x.floor() as u32, y, w: t.full_w.ceil() as u32, h })
+            }
+        }
+    }
+
+    /// Render `tile` and queue its upload. A tile is only uploaded once the
+    /// layout below it is final, so it never has to be sent again.
+    fn send_tile(&mut self, tile: Tile, out: &mut Vec<u8>) -> Area {
+        if tile.layer == 0 {
+            self.doc.advance(&mut self.engine, Some((tile.index + 1) * TILE_H), None);
+        }
+        // Remembered even if empty, so that it is not tried again.
+        let area = self.area(tile).unwrap_or(Area { x: 0, y: 0, w: 0, h: 0 });
+        self.sent.insert(tile, area);
+        if area.h > 0 {
+            let pixels = self.doc.render(&mut self.engine, tile.layer, area.x, area.y, area.w, area.h);
+            self.uploader.transmit(out, tile.id(), area.w, area.h, &pixels);
+        }
+        area
+    }
+
+    /// Put `show` on the screen, uploading the tiles it needs. At most one
+    /// tile is rendered per frame; what is missing then follows in the next
+    /// frames. That shows the top of a new page as soon as possible and
+    /// keeps input responsive while the rest fills in. (A tile that is on
+    /// screen with outdated pixels is not left out: it would stay behind at
+    /// its old position.)
+    fn show(&mut self, frame: &mut Frame, show: &Show) {
+        let (cell_w, cell_h, view_h) = (self.geom.cell_w, self.geom.cell_h, self.geom.view_h() as i64);
+        // The layer's tiles count from its top.
+        let top = match show.layer.checked_sub(1).and_then(|t| self.doc.tables().get(t as usize)) {
+            Some(t) => t.y.floor() as u32,
+            None => 0,
+        };
+        let (from, to) = show.rows;
+        if from >= to || from < top {
             return;
         }
-        let height = TILE_H.min(self.doc.height() - top);
-        let pixels = self.doc.render(&mut self.engine, top, height);
-        self.uploader.transmit(out, tile + 1, self.doc.width, height, &pixels);
+        for index in (from - top) / TILE_H..=(to - 1 - top) / TILE_H {
+            let tile = Tile { layer: show.layer, index };
+            let area = match self.sent.get(&tile) {
+                Some(area) => *area,
+                None if frame.rendered && !self.placed.contains(&(tile, show.placement)) => {
+                    self.unfinished = true;
+                    continue;
+                }
+                None => {
+                    frame.rendered = true;
+                    self.send_tile(tile, &mut frame.out)
+                }
+            };
+            // The rows of this tile that are wanted and land on the screen.
+            let first = from.max(area.y) as i64;
+            let last = to.min(area.y + area.h) as i64;
+            let first = first.max(from as i64 - show.at);
+            let last = last.min(from as i64 - show.at + view_h);
+            let (src_x, width, x) = match show.crop {
+                Some((left, width, x)) => {
+                    let src_x = left.saturating_sub(area.x);
+                    (src_x, width.min(area.w.saturating_sub(src_x)), x)
+                }
+                None => (0, area.w, area.x),
+            };
+            if first >= last || width == 0 {
+                continue;
+            }
+            let y = (show.at + first - from as i64) as u32;
+            kitty::place(
+                &mut frame.out,
+                &kitty::Placement {
+                    id: tile.id(),
+                    placement: show.placement,
+                    row: y / cell_h + 1,
+                    col: x / cell_w + 1,
+                    x_off: x % cell_w,
+                    y_off: y % cell_h,
+                    src_x,
+                    src_y: (first - area.y as i64) as u32,
+                    width,
+                    height: (last - first) as u32,
+                    z: show.z,
+                },
+            );
+            frame.placed.insert((tile, show.placement));
+        }
+    }
+
+    /// The tables that scroll sideways and show in the viewport at `scroll`.
+    fn scrolling_tables(&self, scroll: u32) -> impl Iterator<Item = (usize, &TableBox)> {
+        let (top, bottom) = (scroll as f32, (scroll + self.geom.view_h()) as f32);
+        let in_view = move |t: &TableBox| t.full_w > t.w && t.y < bottom && t.y + t.h > top;
+        self.doc.tables().iter().enumerate().filter(move |(_, t)| in_view(t))
+    }
+
+    /// The tables whose header has scrolled out at the top while more of
+    /// them is still in view, with the screen row their header is held at:
+    /// the top, or above it when the end of the table pushes it out.
+    fn held_headers(&self, scroll: u32) -> Vec<(TableBox, i64)> {
+        let scroll = scroll as f32;
+        let held = |t: &&TableBox| t.head_h > 0.0 && t.h > 2.0 * t.head_h && scroll > t.y && scroll < t.y + t.h;
+        self.doc
+            .tables()
+            .iter()
+            .filter(held)
+            .map(|t| (*t, ((t.y + t.h - t.head_h - scroll).floor() as i64).min(0)))
+            .collect()
     }
 
     fn draw(&mut self) -> Result<()> {
-        let mut out = Vec::new();
-        out.extend_from_slice(b"\x1b[?2026h"); // begin synchronized update
+        let mut frame = Frame::default();
+        frame.out.extend_from_slice(b"\x1b[?2026h"); // begin synchronized update
         if std::mem::take(&mut self.fresh) {
             // First frame or fresh layout: drop whatever was there before.
-            kitty::free_all(&mut out);
-            out.extend_from_slice(b"\x1b[2J");
+            kitty::free_all(&mut frame.out);
+            frame.out.extend_from_slice(b"\x1b[2J");
             self.status.clear();
             self.sprites.forget();
         }
@@ -824,73 +1021,65 @@ impl Viewer {
         (self.scroll, self.target) = (self.scroll.min(max), self.target.min(max));
         let scroll = self.scroll.round() as u32;
         let view_end = (scroll + view_h).min(self.doc.height());
-        let (first, last) = self.visible_tiles(scroll);
-
-        // At most one tile is rendered per frame; the rest of the viewport
-        // follows in the next frames. That shows the top of a new page as
-        // soon as possible and keeps input responsive while it fills in.
-        // (A tile that is on screen with outdated pixels is not left out:
-        // it would stay behind at its old position.)
-        let mut rendered = false;
-        let mut placed = BTreeSet::new();
         self.unfinished = false;
-        for tile in first..=last {
-            if !self.sent.contains(&tile) {
-                if rendered && !self.placed.contains(&tile) {
-                    self.unfinished = true;
-                    continue;
-                }
-                self.send_tile(tile, &mut out);
-                rendered = true;
-            }
-            let top = tile * TILE_H;
-            let bottom = (top + TILE_H).min(view_end);
-            let src_y = scroll.saturating_sub(top);
-            if top + src_y >= bottom {
-                continue;
-            }
-            let dst_y = top + src_y - scroll;
-            kitty::place(
-                &mut out,
-                &kitty::Placement {
-                    id: tile + 1,
-                    row: dst_y / cell_h + 1,
-                    col: self.doc.origin_x / cell_w + 1,
-                    x_off: self.doc.origin_x % cell_w,
-                    y_off: dst_y % cell_h,
-                    src_y,
-                    width: self.doc.width,
-                    height: bottom - (top + src_y),
-                },
-            );
-            placed.insert(tile);
+
+        // The page, then the sideways scrolling tables that sit in it, each
+        // cropped to how far it is scrolled.
+        self.show(&mut frame, &Show { layer: 0, rows: (scroll, view_end), at: 0, crop: None, placement: 1, z: 0 });
+        let tables: Vec<TableBox> = self.scrolling_tables(scroll).map(|(_, t)| *t).collect();
+        for t in &tables {
+            let rows = ((t.y.floor() as u32).max(scroll), ((t.y + t.h).ceil() as u32).min(view_end));
+            let crop = Some(((t.x + t.scroll) as u32, t.w as u32, t.x as u32));
+            let at = rows.0 as i64 - scroll as i64;
+            self.show(&mut frame, &Show { layer: t.layer, rows, at, crop, placement: 1, z: 0 });
+        }
+        // Headers held at the top: the same pixels, placed a second time
+        // above everything else.
+        let held = self.held_headers(scroll);
+        for (t, at) in &held {
+            let rows = (t.y.floor() as u32, (t.y + t.head_h).ceil() as u32);
+            let crop = Some(((t.x + t.scroll) as u32, t.w as u32, t.x as u32));
+            self.show(&mut frame, &Show { layer: t.layer, rows, at: *at, crop, placement: 2, z: 2 });
         }
 
-        for &tile in self.placed.difference(&placed) {
-            kitty::unplace(&mut out, tile + 1);
+        for &(tile, placement) in self.placed.difference(&frame.placed) {
+            kitty::unplace(&mut frame.out, tile.id(), placement);
         }
-        self.placed = placed;
+        self.placed = std::mem::take(&mut frame.placed);
 
-        // Bound terminal memory on long documents.
-        let (lo, hi) = (first.saturating_sub(KEEP_TILES), last.saturating_add(KEEP_TILES));
-        self.sent.retain(|&tile| {
-            let keep = (lo..=hi).contains(&tile);
-            if !keep {
-                kitty::free(&mut out, tile + 1);
-            }
-            keep
-        });
+        // Bound terminal memory on long documents: tiles far from the
+        // viewport go, unless something on screen is made of them.
+        let near = (scroll / TILE_H).saturating_sub(KEEP_TILES)..=(view_end / TILE_H).saturating_add(KEEP_TILES);
+        let far_table = |layer: u16| {
+            let t = self.doc.tables().get(layer as usize - 1);
+            let reach = (KEEP_TILES * TILE_H) as f32;
+            t.is_none_or(|t| t.y > view_end as f32 + reach || t.y + t.h < scroll as f32 - reach)
+        };
+        let far: Vec<Tile> = self
+            .sent
+            .keys()
+            .filter(|tile| match tile.layer {
+                0 => !near.contains(&tile.index),
+                table => far_table(table),
+            })
+            .filter(|tile| !self.placed.iter().any(|(placed, _)| placed == *tile))
+            .copied()
+            .collect();
+        for tile in far {
+            self.sent.remove(&tile);
+            kitty::free(&mut frame.out, tile.id());
+        }
 
-        let rects = self.overlay(scroll);
-        self.sprites.draw(&mut out, &mut self.uploader, &rects, (cell_w, cell_h));
-        self.status_bar(&mut out);
-        out.extend_from_slice(b"\x1b[?2026l");
-        write_all(&out)
+        let rects = self.overlay(scroll, &tables, &held);
+        self.sprites.draw(&mut frame.out, &mut self.uploader, &rects, (cell_w, cell_h));
+        self.status_bar(&mut frame.out);
+        frame.out.extend_from_slice(b"\x1b[?2026l");
+        write_all(&frame.out)
     }
 
     /// The solid rectangles to show on top of or underneath the page, for
     /// the viewport starting at page offset `scroll`.
-    fn overlay(&self, scroll: u32) -> Vec<kitty::Rect> {
+    fn overlay(&self, scroll: u32, tables: &[TableBox], held: &[(TableBox, i64)]) -> Vec<kitty::Rect> {
         // Highlights go under the text where the page lets them show
         // through, and over it as a veil where it has its own background.
         let z = if self.theme.page.is_some() { 1 } else { -1 };
@@ -904,6 +1093,21 @@ impl Viewer {
                 rects.extend(self.screen_rect(area, scroll, self.theme.select, z));
             }
         }
+        // What scrolls underneath a held header must not show through it.
+        for (t, at) in held {
+            let top = scroll as f32 + (*at).max(0) as f32;
+            let height = t.head_h + (*at).min(0) as f32;
+            rects.extend(self.screen_rect([t.x, top, t.w, height], scroll, self.theme.backdrop, 1));
+        }
+        // A scroll bar along the bottom of a sideways scrolling table, or
+        // along the bottom of the viewport while the table goes on below.
+        for t in tables {
+            let thick = (self.geom.cell_h as f32 / 6.0).round().max(2.0);
+            let bottom = (t.y + t.h).min((scroll + self.geom.view_h()) as f32) - 2.0 * thick;
+            let length = (t.w * t.w / t.full_w).max(4.0 * thick);
+            let x = t.x + (t.w - length) * t.scroll / (t.full_w - t.w).max(1.0);
+            rects.extend(self.screen_rect([x, bottom, length, thick], scroll, self.theme.thumb, 3));
+        }
         rects
     }
 
@@ -911,7 +1115,7 @@ impl Viewer {
     /// a rectangle on the screen.
     fn screen_rect(&self, area: [f32; 4], scroll: u32, color: crate::theme::Rgba, z: i32) -> Option<kitty::Rect> {
         let [x, y, w, h] = area.map(|v| v.round() as i64);
-        let (x, y) = (x + self.doc.origin_x as i64, y - scroll as i64);
+        let y = y - scroll as i64;
         let (left, top) = (x.max(0), y.max(0));
         let right = (x + w).min(self.geom.page_w() as i64);
         let bottom = (y + h).min(self.geom.view_h() as i64);
@@ -939,7 +1143,10 @@ impl Viewer {
             Some(line) => format!("{name}:{line}"),
             None => name.to_string(),
         };
-        let hints = "j/k scroll · space/b page · e edit · y copy code · drag to select · q quit";
+        let hints = match self.scrolling_tables(self.scroll.round() as u32).next() {
+            Some(_) => "j/k scroll · h/l or shift+wheel scroll the table · e edit · y copy code · q quit",
+            None => "j/k scroll · space/b page · e edit · y copy code · drag to select · q quit",
+        };
         // A message first, then where the link under the pointer leads.
         let link = match self.hover {
             Hover::Link(link) => self.doc.link(link),
@@ -976,6 +1183,7 @@ fn new_doc(engine: &mut Engine, source: &str, path: &Path, theme: &Theme, zoom: 
         font_px: geom.font_px(zoom),
         base_dir: base_dir(path),
         theme: theme.clone(),
+        scroll_tables: true,
     };
     Doc::new(engine, source, opts)
 }
