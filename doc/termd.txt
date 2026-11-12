@@ -4,15 +4,16 @@
 INTRODUCTION                                                           *termd*
 
 Shows the current Markdown buffer as a rendered page, drawn by termd
-(https://github.com/yangtau/termd), in a Neovim window next to it.
+(https://github.com/yangtau/termd), in a Neovim window: one next to the
+buffer's (|:TermdOpen|), or the buffer's own, where page and source take
+turns (|termd-reader|).
 
   - The preview is an ordinary window: scroll it with CTRL-D, gg, the mouse
     wheel; resize it, move it, put it in a tab page.
   - It shows the buffer as it is, unsaved changes included, as you type.
-  - It scrolls along with the cursor, keeping the cursor's line at the same
-    height as in the editor window.
+  - It scrolls along with the source window (|termd-scrolling|).
   - <CR> in the preview (or `e`, or a double click) moves the cursor in the
-    source window to the line shown there; `q` closes the preview.
+    source window to what the preview's cursor is on; `q` closes the preview.
   - It closes when the buffer is deleted, its window is closed, or Neovim
     exits.
 
@@ -35,18 +36,21 @@ characters or a missing piece. CTRL-L draws it again.
 COMMANDS                                                      *termd-commands*
 
 :TermdOpen                                                        *:TermdOpen*
-    Preview the current buffer.
+    Preview the current buffer in a window next to it.
+
+:TermdRead                                                        *:TermdRead*
+    Show the current buffer as a page in its own window (|termd-reader|).
 
 :TermdClose                                                      *:TermdClose*
     Close the preview of the current buffer (or the one shown in the current
-    window).
+    window). After a reader the buffer stays as source until |:TermdRead|.
 
 :TermdToggle                                                    *:TermdToggle*
     Open or close the current buffer's preview.
 
-The same from Lua: `require("termd").open()`, `.close()`, `.toggle()`,
-`.is_open()`; each takes an optional buffer number. `.jump()` does what <CR>
-does in the preview.
+The same from Lua: `require("termd").open()`, `.read()`, `.close()`,
+`.toggle()`, `.is_open()`; each takes an optional buffer number. `.jump()`
+does what <CR> does in the preview.
 
 ==============================================================================
 SETUP                                                            *termd-setup*
@@ -60,22 +64,74 @@ Calling setup() is optional. The defaults: >lua
       size = nil,           -- width (height for bottom/top) in cells; half if nil
       focus = false,        -- move the focus to the preview when it opens
       live = true,          -- preview unsaved changes
-      follow = true,        -- scroll along with the cursor
+      follow = true,        -- scroll along with the source window
+      smooth = 120,         -- ms the preview takes to catch up; 0 jumps
       debounce = 100,       -- ms after the last change before updating
       cell_size = nil,      -- { w, h } pixels, if the terminal does not say
+      reader = false,       -- open Markdown files as a page (|termd-reader|)
     })
 <
 With lazy.nvim: >lua
 
     {
       "yangtau/termd",
-      cmd = { "TermdOpen", "TermdClose", "TermdToggle" },
+      cmd = { "TermdOpen", "TermdRead", "TermdClose", "TermdToggle" },
       keys = { { "<leader>mp", "<cmd>TermdToggle<cr>", desc = "Markdown preview" } },
       opts = {},
     }
 <
 The text is set at the height of a terminal line; `--zoom` in `args`
 changes that. The preview buffer has 'filetype' `termd`.
+
+==============================================================================
+SCROLLING                                                    *termd-scrolling*
+
+The preview follows the source window, not only the cursor. The lines the
+source window shows are a stretch of the page, as a rule a longer one than
+the preview is high. With the cursor on the first row of the source window
+both windows start with the same text, with the cursor on the last row both
+end with it, and in between the preview slides from the one to the other. So
+the cursor's line is at about the same height in both windows, a step of the
+cursor moves the preview by the same small amount whatever the line looks
+like on the page, and scrolling the source window (CTRL-E, the mouse wheel)
+scrolls the preview too. The place the cursor is at always shows.
+
+When the preview has more than a row to go it scrolls there over a few
+frames (`smooth`, in milliseconds; 0 turns that off). A long jump (gg, a
+search) shows only the last screenful of the way.
+
+Scrolling the preview itself leaves it where you put it until the cursor or
+the source window moves again.
+
+==============================================================================
+READER                                                          *termd-reader*
+
+|:TermdRead| shows the buffer as a page in the window it is in, and with >lua
+
+    require("termd").setup({ reader = true })
+<
+every Markdown file opens that way. The page is read in Normal mode: move
+and scroll as in any buffer. To change the text:
+
+    i a I A o O     Edit the source at the page's cursor: the window shows
+                    the source, with the cursor on the character the page's
+                    cursor was on, in Insert mode. Leaving Insert mode
+                    brings the page back.
+    <CR> or e       Show the source and stay in it, for Normal mode commands
+                    (dd, Visual mode, :s). <Esc> in Normal mode brings the
+                    page back.
+    u CTRL-R        Undo and redo.
+
+What the cursor is on stays at the height in the window it was at, both
+ways. `:w` in the page writes the file; the page counts as modified when the
+file's buffer is. |:TermdClose| goes back to the plain source for this
+buffer.
+
+The plugin has to be loaded for `reader` to do anything: with lazy.nvim, add
+`ft = "markdown"` to its spec.
+
+The page is a picture: there is no searching in it (`/` sees the source after
+<CR>), and its cursor moves by cells, not by words.
 
 ==============================================================================
 HOW IT WORKS                                                       *termd-how*
@@ -89,9 +145,10 @@ color. So Neovim scrolls and redraws the preview like any other text.
 where links and images are found) and renders it in chunks of rows, each an
 image of its own. The plugin sends it the buffer's text and the rows the
 window shows; termd answers with the escape sequences for the chunks in and
-near view, which the plugin writes to the terminal. It also tells which row a
-source line is at, and the other way round. See src/serve.rs for the
-protocol.
+near view, which the plugin writes to the terminal. With every page comes a
+map of the row each source line is at, which the plugin scrolls by; and termd
+tells what in the source a cell of the page shows. See src/serve.rs for the
+protocol. Plugin and termd have to be of the same version.
 
 Run |:checkhealth| termd when something does not work.
 

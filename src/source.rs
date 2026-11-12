@@ -27,6 +27,13 @@ impl Lines {
         self.starts.partition_point(|&start| start <= offset) as u32
     }
 
+    /// How many lines there are, the way an editor counts them: a line
+    /// break at the very end does not start another line.
+    pub fn count(&self) -> u32 {
+        let ends_with_break = self.starts.len() > 1 && self.starts.last() == Some(&self.len);
+        (self.starts.len() - ends_with_break as usize) as u32
+    }
+
     /// Byte offset at which 1-based `line` starts (the end of the text for
     /// lines past the last).
     pub fn start_of(&self, line: u32) -> u32 {
@@ -152,6 +159,8 @@ mod tests {
         let lines = Lines::new("one\ntwo\n\nfour");
         assert_eq!([0, 3, 4, 7, 8, 9, 12].map(|o| lines.line_of(o)), [1, 1, 2, 2, 3, 4, 4]);
         assert_eq!([1, 2, 3, 4, 5].map(|l| lines.start_of(l)), [0, 4, 8, 9, 13]);
+        assert_eq!(lines.count(), 4);
+        assert_eq!(["", "\n", "a\nb", "a\nb\n", "a\n\n"].map(|text| Lines::new(text).count()), [1, 1, 2, 2, 2]);
     }
 
     #[test]

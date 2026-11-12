@@ -14,21 +14,27 @@
 //! size COLS CELL_W CELL_H     the window's width in cells, a cell in pixels
 //! colors BG FG                the editor's colors, #rrggbb or -
 //! text BYTES                  followed by that many bytes of Markdown
-//! show FIRST LAST             the rows (0-based) the window shows
-//! where TAG LINE              which row source LINE is at
-//! which TAG ROW               which source line ROW shows
+//! show FIRST LAST             the rows (0-based) the window shows, or is
+//!                             about to
+//! spot TAG ROW COL            what in the source the cell at ROW, COL shows
 //! quit
 //! ```
 //!
 //! and replies go to stdout, one per line:
 //!
 //! ```text
+//! map CELL_H Y1 Y2 ... END    for a page about to be announced: the pixel
+//!                             offset of the top of each source line, then
+//!                             the page's height; a row is CELL_H pixels
 //! doc ROWS CHUNK BASE         the page is ROWS rows long; rows from
 //!                             i*CHUNK on are image BASE+i
 //! G BYTES                     escape sequences to write to the terminal
-//! at TAG ROW                  answers `where` (ROW may have a fraction)
-//! line TAG LINE               answers `which` (0 for none)
+//! at TAG LINE BYTE            answers `spot`: the source line (from 1; 0
+//!                             for none) and the byte in it (from 0)
 //! ```
+//!
+//! With the map the editor scrolls the page along with the source on its
+//! own, without asking for every move.
 //!
 //! Nothing is written to the terminal directly: the editor owns it and
 //! passes the `G` lines on.
@@ -37,7 +43,9 @@ use crate::doc::{Doc, Engine, LayoutOpts};
 use crate::theme::{Rgb, Theme};
 use crate::{base_dir, kitty};
 use anyhow::Result;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -49,6 +57,8 @@ const CHUNK_PX: u32 = 512;
 const MAX_CHUNK_ROWS: u32 = 297;
 /// Image ids per process; chunk `i` is image `base + i`.
 const IDS: u32 = 4096;
+/// Chunks this far either side of the window are uploaded ahead of it.
+const AHEAD: u32 = 2;
 /// Chunks further than this from the window are freed in the terminal.
 const KEEP: u32 = 8;
 /// Coloring code runs in slices this long, so commands are not held up.
@@ -60,8 +70,7 @@ enum Cmd {
     Colors(Option<Rgb>, Option<Rgb>),
     Text(String),
     Show(u32, u32),
-    Where(String, u32),
-    Which(String, u32),
+    Spot { tag: String, row: u32, col: u32 },
     Quit,
 }
 
@@ -69,6 +78,7 @@ enum Cmd {
 fn parse(line: &str) -> Option<Cmd> {
     let mut words = line.split_whitespace();
     let name = words.next()?;
+    let tag = if name == "spot" { words.next()?.to_string() } else { String::new() };
     let mut num = || words.next()?.parse::<u32>().ok();
     let cmd = match name {
         "size" => Cmd::Size { cols: num()?.max(1), cell_w: num()?.max(1), cell_h: num()?.max(1) },
@@ -80,12 +90,7 @@ fn parse(line: &str) -> Option<Cmd> {
             let mut rest = line.split_whitespace().skip(1);
             Cmd::Colors(color(rest.next()?), color(rest.next()?))
         }
-        "where" | "which" => {
-            let mut rest = line.split_whitespace().skip(1);
-            let tag = rest.next()?.to_string();
-            let n = rest.next()?.parse().ok()?;
-            if name == "where" { Cmd::Where(tag, n) } else { Cmd::Which(tag, n) }
-        }
+        "spot" => Cmd::Spot { tag, row: num()?, col: num()? },
         "quit" => Cmd::Quit,
         _ => return None,
     };
@@ -187,9 +192,9 @@ struct Server {
     /// The text, size or colors changed since the page was laid out.
     stale: bool,
     view: (u32, u32),
-    /// Chunks whose image is in the terminal, and those of them that show
-    /// the current page.
-    uploaded: BTreeSet<u32>,
+    /// Chunks whose image is in the terminal, with a hash of its pixels,
+    /// and those of them that show the current page.
+    uploaded: BTreeMap<u32, u64>,
     current: BTreeSet<u32>,
     uploader: kitty::Uploader,
     tmux: bool,
@@ -211,7 +216,7 @@ pub fn run(path: &Path, engine: Engine, zoom: f32, force_dark: Option<bool>) -> 
         page: None,
         stale: true,
         view: (0, 0),
-        uploaded: BTreeSet::new(),
+        uploaded: BTreeMap::new(),
         current: BTreeSet::new(),
         uploader: uploader(),
         tmux: std::env::var_os("TMUX").is_some(),
@@ -306,32 +311,32 @@ impl Server {
         // Chunks past the end go; the others keep showing the old page
         // until they are rendered again, which beats a blank.
         let mut out = Vec::new();
-        for &chunk in self.uploaded.iter().filter(|&&c| c >= page.chunks()) {
+        for &chunk in self.uploaded.keys().filter(|&&c| c >= page.chunks()) {
             kitty::free(&mut out, self.id(chunk));
         }
-        self.uploaded.retain(|&c| c < page.chunks());
+        self.uploaded.retain(|&c, _| c < page.chunks());
         self.current.clear();
         self.send(&out)?;
+        let mut map = format!("map {}", size.cell_h);
+        for y in page.doc.line_offsets() {
+            let _ = write!(map, " {y}");
+        }
+        self.reply(&map)?;
         self.reply(&format!("doc {rows} {chunk_rows} {}", self.base))?;
         self.page = Some(page);
         Ok(())
     }
 
     fn answer(&mut self, query: Cmd) -> Result<()> {
-        let Some(page) = &mut self.page else { return Ok(()) };
-        let cell_h = page.size.cell_h;
-        let reply = match query {
-            Cmd::Where(tag, line) => {
-                let y = page.doc.offset_of_line(&mut self.engine, line.max(1));
-                format!("at {tag} {:.3}", y as f64 / cell_h as f64)
-            }
-            Cmd::Which(tag, row) => {
-                let line = page.doc.source_line(row * cell_h).unwrap_or(0);
-                format!("line {tag} {line}")
-            }
-            _ => return Ok(()),
-        };
-        self.reply(&reply)
+        let Cmd::Spot { tag, row, col } = query else { return Ok(()) };
+        // The middle of the cell. Without a page there is no place to name,
+        // but whoever asked is waiting for an answer.
+        let spot = self.page.as_ref().and_then(|page| {
+            let Size { cell_w, cell_h, .. } = page.size;
+            page.doc.source_at((col as f32 + 0.5) * cell_w as f32, (row as f32 + 0.5) * cell_h as f32)
+        });
+        let (line, byte) = spot.unwrap_or((0, 0));
+        self.reply(&format!("at {tag} {line} {byte}"))
     }
 
     /// Color code blocks for a moment; chunks with one that changed have
@@ -348,13 +353,13 @@ impl Server {
         }
     }
 
-    /// Upload what the window shows and the chunks either side of it, and
-    /// free those far away.
+    /// Upload what the window shows and the chunks either side of it, the
+    /// nearer ones first, and free those far away.
     fn render_view(&mut self) -> Result<()> {
         let Some(page) = &self.page else { return Ok(()) };
         let last = page.chunks() - 1;
         let (top, bottom) = ((self.view.0 / page.chunk_rows).min(last), (self.view.1 / page.chunk_rows).min(last));
-        let near = (top.saturating_sub(1)..=(bottom + 1).min(last)).filter(|c| !(top..=bottom).contains(c));
+        let near = (1..=AHEAD).flat_map(|d| [top.checked_sub(d), Some(bottom + d).filter(|&c| c <= last)]).flatten();
         let wanted: Vec<u32> = (top..=bottom).chain(near).filter(|c| !self.current.contains(c)).collect();
         for chunk in wanted {
             let mut out = Vec::new();
@@ -362,7 +367,7 @@ impl Server {
             self.send(&out)?;
         }
         let far: Vec<u32> =
-            self.uploaded.iter().copied().filter(|&c| c + KEEP < top || c > bottom + KEEP).collect();
+            self.uploaded.keys().copied().filter(|&c| c + KEEP < top || c > bottom + KEEP).collect();
         if !far.is_empty() {
             let mut out = Vec::new();
             for chunk in far {
@@ -382,13 +387,20 @@ impl Server {
         let rows = page.chunk_rows.min(page.rows - first);
         let (w, h) = (cols * cell_w, rows * cell_h);
         let rgba = page.doc.render(&mut self.engine, 0, 0, first * cell_h, w, h, false);
+        self.current.insert(chunk);
+        // Most of a page stays as it was when its text changes in one
+        // place; the terminal already has those pixels.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (w, h, &rgba[..]).hash(&mut hasher);
+        let hash = hasher.finish();
+        if self.uploaded.insert(chunk, hash) == Some(hash) {
+            return;
+        }
         let id = self.id(chunk);
         self.uploader.transmit(out, id, w, h, &rgba);
         // A virtual placement, for the placeholders to show; uploading the
         // image again replaced the previous one.
         let _ = write!(out, "\x1b_Ga=p,U=1,q=2,i={id},p=1,c={cols},r={rows}\x1b\\");
-        self.uploaded.insert(chunk);
-        self.current.insert(chunk);
     }
 
     fn id(&self, chunk: u32) -> u32 {
@@ -397,7 +409,7 @@ impl Server {
 
     fn free_all(&mut self) {
         let mut out = Vec::new();
-        for &chunk in &self.uploaded {
+        for &chunk in self.uploaded.keys() {
             kitty::free(&mut out, self.id(chunk));
         }
         self.uploaded.clear();
@@ -441,8 +453,8 @@ mod tests {
         assert_eq!(parse("size 80 10 21\n"), Some(Cmd::Size { cols: 80, cell_w: 10, cell_h: 21 }));
         assert_eq!(parse("show 40 12"), Some(Cmd::Show(12, 40)));
         assert_eq!(parse("colors #1e1e2e -"), Some(Cmd::Colors(Some(Rgb(0x1e, 0x1e, 0x2e)), None)));
-        assert_eq!(parse("where 7 120"), Some(Cmd::Where("7".into(), 120)));
-        assert_eq!(parse("which a 3"), Some(Cmd::Which("a".into(), 3)));
+        assert_eq!(parse("spot a 3 14"), Some(Cmd::Spot { tag: "a".into(), row: 3, col: 14 }));
+        assert_eq!(parse("spot a 3"), None);
         assert_eq!(parse("quit"), Some(Cmd::Quit));
         assert_eq!(parse("size 80"), None);
         assert_eq!(parse("dance"), None);

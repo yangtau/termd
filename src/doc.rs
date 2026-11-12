@@ -844,6 +844,7 @@ impl Doc {
 
     /// Page offset of the text that comes from 1-based source `line` (or the
     /// first text after it).
+    #[cfg(test)]
     pub fn offset_of_line(&mut self, eng: &mut Engine, line: u32) -> u32 {
         self.resolve(eng, Anchor { src: self.start_of_line(line), frac: 0.0 })
     }
@@ -851,6 +852,79 @@ impl Doc {
     /// Source offset at which 1-based `line` starts.
     pub fn start_of_line(&self, line: u32) -> u32 {
         self.lines.start_of(line)
+    }
+
+    /// Page offset of the top of every source line, followed by the height
+    /// of the page: where the source is on the page, for scrolling the two
+    /// together. A line that shows nothing of its own (an empty one, a
+    /// fence, an image) gets its share of the gap between its neighbors, so
+    /// the offsets never go back and do not stand still for long.
+    pub fn line_offsets(&self) -> Vec<u32> {
+        let count = self.lines.count() as usize;
+        // Top and bottom of the text each line shows.
+        let mut shown: Vec<Option<(f32, f32)>> = vec![None; count];
+        // (Text that comes from nowhere, like that of an empty code block,
+        // would all be put on the first line.)
+        for (_, item, _, buf, content) in self.texts().filter(|(.., content)| !content.map.range().is_empty()) {
+            // (Nor does any part of a text come from outside the lines the
+            // whole of it comes from.)
+            let range = content.map.range();
+            let within = self.lines.line_of(range.start)..=self.lines.line_of(range.end.saturating_sub(1));
+            let line_of = |offset: u32| {
+                self.lines.line_of(content.map.to_source(offset)).clamp(*within.start(), *within.end())
+            };
+            for run in buf.layout_runs() {
+                let start = content.line_starts.get(run.line_i).copied().unwrap_or(0);
+                let first = run.glyphs.iter().map(|g| g.start).min().unwrap_or(0) as u32;
+                let last = run.glyphs.iter().map(|g| g.start).max().unwrap_or(0) as u32;
+                // A line of the page can hold several of the source.
+                let (from, to) = (line_of(start + first), line_of(start + last));
+                let (top, bottom) = (item.y + run.line_top, item.y + run.line_top + run.line_height);
+                for line in from..=to.max(from) {
+                    let Some(slot) = shown.get_mut(line as usize - 1) else { break };
+                    *slot = Some(slot.map_or((top, bottom), |(t, b)| (t.min(top), b.max(bottom))));
+                }
+            }
+        }
+        let height = self.height as f32;
+        let mut tops = Vec::with_capacity(count + 1);
+        let mut above = 0.0f32; // the bottom of the text so far
+        let mut line = 0;
+        while line < count {
+            if let Some((top, bottom)) = shown[line] {
+                tops.push(top);
+                above = above.max(bottom);
+                line += 1;
+                continue;
+            }
+            // Lines `line..next` share what lies between the text above
+            // them and the text below.
+            let next = (line..count).find(|&l| shown[l].is_some()).unwrap_or(count);
+            let below = shown.get(next).copied().flatten().map_or(height, |(top, _)| top).max(above);
+            let share = (below - above) / (next - line) as f32;
+            tops.extend((0..next - line).map(|i| above + share * i as f32));
+            line = next;
+        }
+        tops.push(height);
+        let mut reached = 0;
+        tops.into_iter()
+            .map(|top| {
+                reached = reached.max(top.clamp(0.0, height) as u32);
+                reached
+            })
+            .collect()
+    }
+
+    /// Where in the source the text at (or nearest to) the point (`x`, `y`)
+    /// of the page comes from: the 1-based line, and the byte in it.
+    pub fn source_at(&self, x: f32, y: f32) -> Option<(u32, u32)> {
+        let hit = self.hit(x, y)?;
+        let Kind::Text { content: Some(content), .. } = &self.lay.items.get(hit.item as usize)?.kind else {
+            return None;
+        };
+        let src = content.map.to_source(hit.character);
+        let line = self.lines.line_of(src);
+        Some((line, src - self.lines.start_of(line)))
     }
 
     /// The tables laid out so far.
@@ -1679,6 +1753,7 @@ impl Layout {
                     text: format!("[image: {label}]"),
                     italic: true,
                     color: Some(self.theme.dim),
+                    src: self.at.clone(),
                     ..Span::default()
                 });
             }
@@ -2443,6 +2518,54 @@ Last &amp; final paragraph.
         // line) leads to the next text.
         let y = doc.offset_of_line(&mut eng, 19);
         assert_eq!(doc.source_line(y), Some(20));
+    }
+
+    #[test]
+    fn every_source_line_has_a_place_on_the_page() {
+        let Some(mut eng) = engine() else { return };
+        let mut doc = layout(&mut eng, SAMPLE, 900);
+        let tops = doc.line_offsets();
+        // One for each line, and the height.
+        assert_eq!(tops.len(), SAMPLE.lines().count() + 1);
+        assert_eq!(tops.last(), Some(&doc.height()));
+        assert!(tops.windows(2).all(|w| w[0] <= w[1]), "{tops:?}");
+        // Lines with text are where their text is.
+        for line in [1, 3, 6, 7, 9, 12, 13, 18, 20] {
+            let y = doc.offset_of_line(&mut eng, line);
+            assert!(tops[line as usize - 1].abs_diff(y) <= 1, "line {line}: {} and {y}", tops[line as usize - 1]);
+        }
+        // Empty lines lie between the text above and below them.
+        for line in [2usize, 5, 8, 15, 19] {
+            assert!(tops[line - 1] > tops[line - 2] && tops[line - 1] < tops[line], "line {line} in {tops:?}");
+        }
+        // A paragraph's lines that were joined on the page are at one height.
+        assert_eq!(tops[2], tops[3]);
+    }
+
+    #[test]
+    fn line_offsets_hold_at_any_width() {
+        let Some(mut eng) = engine() else { return };
+        // A missing image shows as text in its paragraph, which wraps where
+        // the width says; all of it comes from line 5.
+        let text = "---\ntitle: x\n---\n\nSome words, then ![a missing image](missing.png) and more after it.\n\nLast.\n";
+        for width in [200, 300, 420, 900] {
+            let doc = layout(&mut eng, text, width);
+            let tops = doc.line_offsets();
+            assert!(tops.windows(2).all(|w| w[0] <= w[1]), "{width}: {tops:?}");
+            assert!(tops[4] > tops[1] && tops[6] > tops[4], "{width}: {tops:?}");
+        }
+    }
+
+    #[test]
+    fn points_map_to_places_in_the_source() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, SAMPLE, 900);
+        let lines: Vec<&str> = SAMPLE.lines().collect();
+        for needle in ["Title", "second", "a link", "two", "quoted", "b = 2", "omega", "final"] {
+            let (x, y) = find(&doc, needle);
+            let (line, byte) = doc.source_at(x, y).expect("there is text");
+            assert!(lines[line as usize - 1][byte as usize..].starts_with(needle), "{needle:?} at {line}:{byte}");
+        }
     }
 
     #[test]
