@@ -11,6 +11,6 @@ local function command(name, fn, desc)
 end
 
 command("TermdOpen", "open", "Preview the buffer with termd, in a window next to it")
-command("TermdRead", "read", "Show the buffer as a page in this window; i edits, <Esc> returns")
+command("TermdRead", "read", "Read the buffer: the page over its window, until q or an edit")
 command("TermdClose", "close", "Close the buffer's termd preview")
 command("TermdToggle", "toggle", "Open or close the buffer's termd preview")

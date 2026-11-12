@@ -94,19 +94,24 @@ environment.systemPackages = [ inputs.termd.packages.${pkgs.system}.default ];
 - 在预览窗口里按 `<CR>`（或 `e`、双击），源码窗口的光标跳到预览光标所在的那个字上；按 `q` 关闭；
 - 删除缓冲区、关掉预览窗口或退出 Neovim 时，预览自动关闭。
 
-**阅读模式**：`:TermdRead` 让当前窗口直接显示页面，页面和源码在同一个窗口里轮流出现；
-设置 `reader = true` 之后，打开 Markdown 文件默认就是页面。
+**阅读模式**：比 Normal 再「退出一层」的状态。在 Markdown 缓冲区的 Normal 模式下按 `<Esc>`
+（也就是从 Insert 模式按两下 `<Esc>`）或 `:TermdRead`，页面就盖在源码窗口上；打开 Markdown 文件时默认也直接进入
+（`reader = false` 关闭）。
 
-- Normal 模式下看到的是页面，像普通缓冲区一样移动、滚动；
-- `i` / `a` / `I` / `A` / `o` / `O`：窗口换成源码，光标落在页面光标所在的那个字上，并进入 Insert 模式；
-  离开 Insert 模式就回到页面；
-- `<CR>`（或 `e`）：换成源码并留在源码里，用来执行 Normal 模式的命令（`dd`、可视模式、`:s` 等）；
-  在 Normal 模式下按 `<Esc>` 回到页面；
-- `u` / `<C-r>`：撤销 / 重做；
-- 来回切换时，光标所在的内容在窗口里的高度不变；
-- 在页面里 `:w` 写的是文件，文件有未保存的修改时页面也显示为已修改；
-- `:TermdClose` 让这个缓冲区回到普通的源码（直到再次 `:TermdRead`）。
-- 页面是一张图：在页面里不能搜索（按 `<CR>` 回到源码再 `/`），光标按字符格移动而不是按词。
+- 页面是一个盖在源码窗口上、不能进入的浮动窗口，窗口里的缓冲区和焦点仍是源码：
+  像平常一样移动光标、滚动（`j`、`<C-d>`、`gg`、`/`、`n`、鼠标滚轮），页面跟着走，
+  页面左边缘的标记是光标所在的那一行；再按 `<Esc>` 不会有反应；
+- 因为当前缓冲区还是文件本身，neo-tree 能定位到文件，状态栏、`:w`、`<C-^>` 也都照常；
+- `q` / `<CR>`：退出阅读；
+- 编辑就会退出阅读：进入 Insert、Visual、操作符（`d`、`c`、`y`…）或者文本发生变化（`x`、`p`、`u`、`:s`）；
+  `:w`、搜索这类命令行操作不会退出；
+- 进出阅读时 termd 一直在后台运行，所以重新进入是即时的（`:TermdClose` 才会停掉它，
+  之后 `<Esc>` 不再进入阅读，直到再次 `:TermdRead`）；
+- 有分屏预览（`:TermdOpen`）、diff、浮动窗口或正在执行宏时，`<Esc>` 保持原样；
+  `read_key` 可以换成别的键，设为 `false` 则只用 `:TermdRead`；
+- 自动进入只在文件第一次显示时发生：退出阅读后切走再切回来，仍然是源码；
+- Neovim 不支持自定义模式，状态栏的模式仍显示 NORMAL；状态栏可以用 `require("termd").reading()`
+  判断当前窗口是否在阅读。阅读时终端光标在 Normal 模式下隐藏，标记的颜色是 `TermdCursor` 高亮组。
 
 滚动：预览跟随的是源码窗口，而不只是光标所在的行。源码窗口里显示的那些行对应页面上的一段，
 这一段通常比预览窗口高；光标在源码窗口第一行时两个窗口的开头对齐，在最后一行时结尾对齐，
@@ -126,7 +131,7 @@ termd（`--serve`）只负责排版、按需渲染进入视野的那几块，再
 - `termguicolors` 打开（图像是用前景色区分的）。
 - tmux 里需要 `set -g allow-passthrough on`，外层终端同样得是 kitty 或 Ghostty。
 - 图像在本机通过共享内存（kitty）或临时文件（其他终端）传给终端，写进终端的只是很短的转义序列。
-  通过 SSH 时只能把像素内嵌在转义序列里，由于 Neovim 的界面进程同时也在往终端写，屏幕更新很频繁时
+通过 SSH 时只能把像素内嵌在转义序列里，由于 Neovim 的界面进程同时也在往终端写，屏幕更新很频繁时
   偶尔会出现乱码或缺块，按 `<C-l>` 重绘即可。
 
 用 lazy.nvim 安装：
@@ -134,9 +139,9 @@ termd（`--serve`）只负责排版、按需渲染进入视野的那几块，再
 ```lua
 {
   "yangtau/termd",
+  ft = "markdown",       -- 阅读模式需要：打开 Markdown 文件时就加载插件
   cmd = { "TermdOpen", "TermdRead", "TermdClose", "TermdToggle" },
   keys = { { "<leader>mp", "<cmd>TermdToggle<cr>", desc = "Markdown preview" } },
-  -- ft = "markdown",     -- 用 reader = true 时需要：打开 Markdown 文件时就加载插件
   opts = {
     -- 下面都是默认值
     cmd = "termd",        -- termd 可执行文件
@@ -149,7 +154,8 @@ termd（`--serve`）只负责排版、按需渲染进入视野的那几块，再
     smooth = 120,         -- 预览滚到位用的毫秒数；0 表示直接跳
     debounce = 100,       -- 停止输入多少毫秒后更新
     cell_size = nil,      -- 终端没报告字符格像素尺寸时手动指定，如 { 10, 21 }
-    reader = false,       -- 打开 Markdown 文件时默认显示页面（阅读模式）
+    reader = true,        -- 打开 Markdown 文件时进入阅读模式
+    read_key = "<Esc>",   -- Normal 模式下进入阅读的键；false 表示不设
   },
 }
 ```

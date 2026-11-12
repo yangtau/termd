@@ -9,8 +9,8 @@
 -- for the rows that come into view.
 --
 -- The page is shown in one of two ways: in a window of its own next to the
--- source, which it follows (a "split" session, `open`), or in the source's
--- window, taking turns with it (a "reader" session, `read`).
+-- source, which it follows (a "split" session, `open`), or laid over the
+-- source's window, following the cursor there (a "reader" session, `read`).
 --
 -- Needs a terminal with Unicode placeholders (kitty, Ghostty) and
 -- 'termguicolors'.
@@ -44,10 +44,12 @@ local defaults = {
   -- Size of a terminal cell in pixels, { width, height }, when the
   -- terminal does not report it.
   cell_size = nil,
-  -- Show Markdown buffers as a page to begin with, in their own window:
-  -- `i` (and `a`, `o`, ...) edits the source at the cursor and leaving Insert
-  -- mode brings the page back. `:TermdRead` does this for one buffer.
-  reader = false,
+  -- Open Markdown files reading: the page over the source, following its
+  -- cursor, until `q`, <CR> or editing (`i`, `dd`, ...).
+  reader = true,
+  -- The key that reads a Markdown buffer from Normal mode (so <Esc> twice
+  -- from Insert mode). false for none; `:TermdRead` reads any time.
+  read_key = "<Esc>",
 }
 
 M.config = vim.deepcopy(defaults)
@@ -186,10 +188,15 @@ local DIACRITICS = {
 }
 
 --- The text of row `row` (0-based) of an image `cols` cells wide. Only the
---- first cell names its row and column; the terminal counts on from there.
+--- first two cells name their row and column; the terminal counts on from
+--- there. (Two: the first may be covered by the reader's mark.)
 local function placeholder_row(row, cols)
-  local first = PLACEHOLDER .. vim.fn.nr2char(DIACRITICS[row + 1]) .. vim.fn.nr2char(DIACRITICS[1])
-  return first .. PLACEHOLDER:rep(cols - 1)
+  local mark = vim.fn.nr2char(DIACRITICS[row + 1])
+  local text = PLACEHOLDER .. mark .. vim.fn.nr2char(DIACRITICS[1])
+  if cols > 1 then
+    text = text .. PLACEHOLDER .. mark .. vim.fn.nr2char(DIACRITICS[2])
+  end
+  return text .. PLACEHOLDER:rep(cols - 2)
 end
 M._placeholder_row = placeholder_row
 
@@ -221,7 +228,7 @@ end
 
 --- The window that shows the page right now, if any.
 local function page_win(s)
-  local win = s.kind == "reader" and s.win or s.pwin
+  local win = s.pwin
   if valid_win(win) and vim.api.nvim_win_get_buf(win) == s.pbuf then
     return win
   end
@@ -257,7 +264,7 @@ end
 --- Tell termd the width of the page's window and the cell size, if they
 --- changed.
 local function send_size(s)
-  local win = s.kind == "reader" and s.win or s.pwin
+  local win = s.pwin
   if not (valid_win(win) and s.job) then
     return
   end
@@ -269,10 +276,8 @@ local function send_size(s)
     end
     w, h = 10, 20
   end
-  -- A reader's window may be showing the source, with its line numbers and
-  -- signs; the page takes the whole width.
   local info = vim.fn.getwininfo(win)[1]
-  local cols = math.max(1, info.width - (page_win(s) and info.textoff or 0))
+  local cols = math.max(1, info.width - info.textoff)
   local size = ("size %d %d %d\n"):format(cols, w, h)
   if size ~= s.size then
     s.size, s.cols = size, cols
@@ -400,6 +405,20 @@ local function page_options(win)
   end
 end
 
+local mark_ns = vim.api.nvim_create_namespace("termd_mark")
+
+--- Mark row `row` of a reader's page as the one the cursor is on.
+local function mark(s, row)
+  if s.kind ~= "reader" or not vim.api.nvim_buf_is_valid(s.pbuf) then
+    return
+  end
+  s.mark = vim.api.nvim_buf_set_extmark(s.pbuf, mark_ns, row, 0, {
+    id = s.mark,
+    virt_text = { { "▌", "TermdCursor" } },
+    virt_text_pos = "overlay",
+  })
+end
+
 --- Show the page from row `top` (0-based) in `win`, with the cursor on row
 --- `row`, or as near to it as the window lets it be.
 local function set_view(s, win, top, row, col)
@@ -412,6 +431,7 @@ local function set_view(s, win, top, row, col)
   vim.api.nvim_win_call(win, function()
     vim.fn.winrestview({ topline = top + 1, lnum = lnum, col = col or 0, leftcol = 0 })
   end)
+  mark(s, lnum - 1)
   send_view(s)
 end
 
@@ -578,7 +598,7 @@ local function fill(s, rows, chunk, base)
   vim.bo[s.pbuf].modifiable = true
   vim.api.nvim_buf_set_lines(s.pbuf, kept, -1, false, lines)
   vim.bo[s.pbuf].modifiable = false
-  vim.bo[s.pbuf].modified = s.kind == "reader" and vim.bo[s.buf].modified or false
+  vim.bo[s.pbuf].modified = false
   if not same then
     vim.api.nvim_buf_clear_namespace(s.pbuf, ns, 0, -1)
   end
@@ -601,68 +621,15 @@ end
 
 -- The reader --------------------------------------------------------------
 --
--- A reader session shows the page in the source's own window: the window
--- holds the page's buffer while reading (state "page") and the source
--- buffer while editing: for one stay in Insert mode ("edit") or until
--- <Esc> ("source"). Going either way, the place the cursor is at stays at
--- the height in the window it was at.
-
---- A reader's page stands for the file: it is unsaved when that is, so
---- that `:q` and the status line say the same for both.
-local function mirror_modified(s)
-  if s.kind == "reader" and vim.api.nvim_buf_is_valid(s.pbuf) and vim.api.nvim_buf_is_valid(s.buf) then
-    local modified = vim.bo[s.buf].modified
-    if vim.bo[s.pbuf].modified ~= modified then
-      vim.bo[s.pbuf].modified = modified
-    end
-  end
-end
-
---- Remember what the page's cursor is on and how high in the window it is,
---- to put it back there when the page is laid out anew.
-local function note_anchor(s)
-  local win = page_win(s)
-  if not (win and s.map) then
-    return
-  end
-  local cursor = vim.api.nvim_win_get_cursor(win)
-  local top = vim.fn.line("w0", win) - 1
-  s.page_col = cursor[2]
-  if s.set and s.set.top == top and s.set.lnum == cursor[1] then
-    return -- where `place` put it: the anchor it had is more exact
-  end
-  s.set = { top = top, lnum = cursor[1] }
-  s.anchor = { line = line_of(s, cursor[1] - 1), winline = cursor[1] - top }
-end
-
---- Scroll the page so that its anchor is where it was in the window.
-local function place(s)
-  local win = page_win(s)
-  local anchor = s.anchor
-  if not (win and anchor and s.map and s.doc) then
-    return
-  end
-  local rows = vim.api.nvim_buf_line_count(s.pbuf)
-  local height = vim.api.nvim_win_get_height(win)
-  local row = clamp(math.floor(row_of(s, anchor.line) + 1e-4), 0, rows - 1)
-  local top = clamp(row - (anchor.winline - 1), 0, math.max(0, rows - height))
-  set_view(s, win, top, row, s.page_col)
-end
-
---- While the source is being edited, have termd keep the part of the page
---- ready that will show when the page comes back.
-local function prefetch(s)
-  local win = s.win
-  if not (s.doc and s.map and valid_win(win)) or vim.api.nvim_win_get_buf(win) ~= s.buf then
-    return
-  end
-  local lnum, winline
-  vim.api.nvim_win_call(win, function()
-    lnum, winline = vim.fn.line("."), vim.fn.winline()
-  end)
-  local top = math.floor(row_of(s, lnum)) - (winline - 1)
-  show(s, top, top + vim.api.nvim_win_get_height(win) - 1)
-end
+-- A reader session lays the page over the source's window, in a floating
+-- window of the same size that cannot be entered (`s.pwin` while reading).
+-- The source stays the window's buffer and has the focus: its cursor moves
+-- and the page follows it as a preview follows its source window, a mark
+-- at the left edge of the page showing where the cursor is. So whatever
+-- looks at the current buffer (`:w`, a file tree, the status line, `/`)
+-- finds the file. Reading ends when the text is changed or Normal mode
+-- left for anything but the command line; `q` and <CR> end it too. termd
+-- keeps running in between, so that the page comes back at once.
 
 --- The first line to show in `win` for `line` to have `above` screen rows
 --- above it.
@@ -685,142 +652,146 @@ local function topline_for(win, line, above)
   return top
 end
 
---- Put the other buffer of the two in the reader's window.
-local function swap(s, buf)
-  local win = s.win
-  local alternate = -1
-  vim.api.nvim_win_call(win, function()
-    alternate = vim.fn.bufnr("#")
-  end)
-  s.swapping = true
-  local ok, err = pcall(vim.api.nvim_win_set_buf, win, buf)
-  s.swapping = false
-  if not ok then
-    notify(tostring(err), vim.log.levels.ERROR)
-    return false
-  end
-  -- The two taking turns is not going from one file to another: CTRL-^
-  -- still leads to the file edited before.
-  if alternate > 0 and alternate ~= s.buf and alternate ~= s.pbuf and vim.api.nvim_buf_is_valid(alternate) then
-    vim.api.nvim_win_call(win, function()
-      pcall(vim.fn.setreg, "#", alternate)
-    end)
-  end
-  if buf == s.pbuf then
-    page_options(win)
-  end
-  return true
-end
+-- The terminal's cursor is in the source window, under the page: hidden
+-- there while it is read (with a highlight that blends it away entirely).
+local saved_guicursor
 
---- Show the page instead of the source, the cursor's place where it is in
---- the window.
-local function to_page(s)
-  local win = s.win
-  if not valid_win(win) or vim.api.nvim_win_get_buf(win) ~= s.buf then
-    return
-  end
-  local v = source_view(win)
-  if not swap(s, s.pbuf) then
-    return
-  end
-  s.state = "page"
-  mirror_modified(s)
-  s.anchor = { line = v.lnum + v.along * 0.99, winline = v.winline }
-  -- The page may still show the text as it was a moment ago; it is placed
-  -- again when the new one arrives.
-  send_text(s)
-  send_size(s)
-  place(s)
-end
-
---- Show the source instead of the page, its cursor on what the page's
---- cursor is on. With `key` (i, a, o, ...) that is typed there and the page
---- comes back after Insert mode; without, the source stays until <Esc>.
-local function to_source(s, key)
-  local win = page_win(s)
-  if not win then
-    return
-  end
-  local cursor = vim.api.nvim_win_get_cursor(win)
-  local cell, winline = 0, 1
-  vim.api.nvim_win_call(win, function()
-    cell, winline = vim.fn.virtcol(".") - 1, vim.fn.winline()
-  end)
-  local line, byte = spot(s, cursor[1] - 1, cell)
-  if sessions[s.buf] ~= s or page_win(s) ~= win then
-    return -- gone while waiting for termd
-  end
-  line = clamp(line, 1, vim.api.nvim_buf_line_count(s.buf))
-  s.page_col = cursor[2]
-  if not swap(s, s.buf) then
-    return
-  end
-  s.state = key and "edit" or "source"
-  vim.api.nvim_win_call(win, function()
-    vim.fn.winrestview({ topline = topline_for(win, line, winline - 1), lnum = line, col = byte })
-  end)
-  if key then
-    -- Mapped, as it would be when typed in the source; and ahead of what
-    -- was typed after it.
-    vim.api.nvim_feedkeys(key, "mi", false)
+local function hide_cursor(hide)
+  if hide and not saved_guicursor then
+    saved_guicursor = vim.o.guicursor
+    vim.api.nvim_set_hl(0, "TermdHiddenCursor", { blend = 100, nocombine = true })
+    vim.o.guicursor = (saved_guicursor ~= "" and saved_guicursor .. "," or "") .. "n:TermdHiddenCursor"
+  elseif not hide and saved_guicursor then
+    vim.o.guicursor = saved_guicursor
+    saved_guicursor = nil
   end
 end
 
---- Run an Ex command (undo, redo) on the source while the page shows, and
---- bring what it changed into view.
-local function in_source(s, command)
-  local win = page_win(s)
-  if not win then
-    return
+local function reading_in(win)
+  for _, s in pairs(sessions) do
+    if s.kind == "reader" and s.swin == win and valid_win(s.pwin) then
+      return s
+    end
   end
-  local lnum
-  local before = vim.api.nvim_buf_get_changedtick(s.buf)
+end
+
+local function update_cursor()
+  hide_cursor(reading_in(vim.api.nvim_get_current_win()) ~= nil)
+end
+
+--- Where the page goes over window `win`, which has the source: all of
+--- it but the winbar.
+local function overlay_config(win)
+  local info = vim.fn.getwininfo(win)[1]
+  return {
+    relative = "win",
+    win = win,
+    row = 0,
+    col = 0,
+    width = math.max(1, info.width),
+    height = math.max(1, info.height),
+  }
+end
+
+--- Keys of the source buffer while reading, and what they were before.
+local function reading_keys(s)
+  local keys = { "q", "<CR>" }
+  if M.config.read_key ~= "<Esc>" then
+    table.insert(keys, "<Esc>")
+  end
+  return keys
+end
+
+local function map_reading_keys(s)
+  s.saved_maps = {}
   vim.api.nvim_buf_call(s.buf, function()
-    pcall(vim.cmd, command)
-    lnum = vim.fn.line(".")
+    for _, lhs in ipairs(reading_keys(s)) do
+      local old = vim.fn.maparg(lhs, "n", false, true)
+      if old.buffer == 1 then
+        s.saved_maps[#s.saved_maps + 1] = old
+      end
+      vim.keymap.set("n", lhs, function()
+        M.unread(s.buf)
+      end, { buffer = s.buf, nowait = true, desc = "Stop reading" })
+    end
   end)
-  if vim.api.nvim_buf_get_changedtick(s.buf) == before then
+end
+
+local function unmap_reading_keys(s)
+  if not (s.saved_maps and vim.api.nvim_buf_is_valid(s.buf)) then
     return
   end
-  -- Where that is now, if it shows; else the middle of the window.
-  local height = vim.api.nvim_win_get_height(win)
-  local at = math.floor(row_of(s, lnum)) - (vim.fn.line("w0", win) - 1)
-  s.anchor = { line = lnum, winline = (at >= 0 and at < height) and at + 1 or math.ceil(height / 2) }
-  mirror_modified(s)
+  vim.api.nvim_buf_call(s.buf, function()
+    for _, lhs in ipairs(reading_keys(s)) do
+      pcall(vim.keymap.del, "n", lhs, { buffer = s.buf })
+    end
+    for _, old in ipairs(s.saved_maps) do
+      pcall(vim.fn.mapset, "n", false, old)
+    end
+  end)
+  s.saved_maps = nil
+end
+
+--- Lay the page over window `win`.
+local function show_page(s, win)
+  if valid_win(s.pwin) then
+    return
+  end
+  s.swin = win
+  local config = overlay_config(win)
+  config.focusable = false
+  config.style = "minimal"
+  config.zindex = 1 -- under every other float: completion, hover, messages
+  config.border = "none" -- whatever 'winborder' says
+  config.noautocmd = true
+  local ok, pwin = pcall(vim.api.nvim_open_win, s.pbuf, false, config)
+  if not ok then
+    notify(tostring(pwin), vim.log.levels.ERROR)
+    return
+  end
+  s.pwin = pwin
+  page_options(pwin)
+  vim.wo[pwin].winhighlight = "NormalFloat:Normal"
+  map_reading_keys(s)
+  update_cursor()
+  send_size(s)
   send_text(s)
-  place(s)
+  s.view = nil
+  follow(s, true)
+end
+
+--- Take the page away, and the source shows.
+local function hide_page(s)
+  if s.pwin == nil then
+    return
+  end
+  stop_scroll(s)
+  if valid_win(s.pwin) then
+    pcall(vim.api.nvim_win_close, s.pwin, true)
+  end
+  s.pwin = nil
+  unmap_reading_keys(s)
+  update_cursor()
+end
+
+--- See whether the page still has the source under it.
+local function check_page(s)
+  if s.pwin == nil then
+    return
+  end
+  if not valid_win(s.pwin) or not valid_win(s.swin) or vim.api.nvim_win_get_buf(s.swin) ~= s.buf then
+    hide_page(s)
+  else
+    local config = overlay_config(s.swin)
+    local now_config = vim.api.nvim_win_get_config(s.pwin)
+    if now_config.width ~= config.width or now_config.height ~= config.height then
+      pcall(vim.api.nvim_win_set_config, s.pwin, config)
+    end
+  end
+  update_cursor()
 end
 
 local close_session
-
---- See what the reader's window shows after buffers or windows changed
---- without its doing: another buffer ends the session, one of its two
---- makes that its state.
-local function reconcile(s)
-  if sessions[s.buf] ~= s then
-    return
-  end
-  local shown = valid_win(s.win) and vim.api.nvim_win_get_buf(s.win)
-  if shown ~= s.buf and shown ~= s.pbuf then
-    -- Its window is gone, or used for something else; the page may show
-    -- in another (after a split).
-    local other = vim.fn.win_findbuf(s.pbuf)[1]
-    if not other then
-      return close_session(s)
-    end
-    s.win, shown = other, s.pbuf
-  end
-  if shown == s.pbuf and s.state ~= "page" then
-    s.state = "page"
-    page_options(s.win)
-    send_size(s)
-    s.set = nil
-    note_anchor(s)
-    send_view(s)
-  elseif shown == s.buf and s.state == "page" then
-    s.state = "source"
-  end
-end
 
 -- termd -------------------------------------------------------------------
 
@@ -852,13 +823,7 @@ local function handle(s, line)
     s.doc = { rows = rows, chunk = chunk, base = base }
     fill(s, rows, chunk, base)
     s.view = nil
-    if s.kind == "reader" then
-      if page_win(s) then
-        place(s)
-      else
-        prefetch(s)
-      end
-    elseif M.config.follow then
+    if page_win(s) and (s.kind == "reader" or M.config.follow) then
       follow(s, true)
     end
     send_view(s)
@@ -922,24 +887,7 @@ close_session = function(s, leaving)
     end, 1000)
   end
   if s.kind == "reader" then
-    if vim.api.nvim_buf_is_valid(s.buf) then
-      pcall(vim.keymap.del, "n", "<Esc>", { buffer = s.buf })
-      vim.bo[s.buf].bufhidden = s.bufhidden or ""
-      if not leaving then
-        -- The source is shown where the page was, and is the alternate
-        -- file where the page would be.
-        for _, win in ipairs(vim.fn.win_findbuf(s.pbuf)) do
-          pcall(vim.api.nvim_win_set_buf, win, s.buf)
-        end
-        for _, win in ipairs(vim.api.nvim_list_wins()) do
-          vim.api.nvim_win_call(win, function()
-            if vim.fn.bufnr("#") == s.pbuf and vim.api.nvim_get_current_buf() ~= s.buf then
-              pcall(vim.fn.setreg, "#", s.buf)
-            end
-          end)
-        end
-      end
-    end
+    hide_page(s)
   elseif valid_win(s.pwin) and #vim.api.nvim_list_wins() > 1 then
     pcall(vim.api.nvim_win_close, s.pwin, true)
   end
@@ -982,7 +930,8 @@ local function new_session(buf, kind)
   end
   local pbuf = vim.api.nvim_create_buf(false, true)
   vim.bo[pbuf].filetype = "termd"
-  pcall(vim.api.nvim_buf_set_name, pbuf, "termd://" .. vim.fn.fnamemodify(document_path(buf), ":t"))
+  -- No name: a name is taken for a file by what looks for the current one
+  -- (a file tree revealing it would ask to change to its directory).
   local s = {
     kind = kind,
     buf = buf,
@@ -1067,14 +1016,12 @@ local function start(s)
       local scrolled = vim.v.event
       local pwin = page_win(s)
       if pwin and scrolled[tostring(pwin)] then
-        if s.kind == "reader" then
-          note_anchor(s)
-        elseif s.set and vim.fn.line("w0", pwin) - 1 ~= s.set.top then
+        if s.set and vim.fn.line("w0", pwin) - 1 ~= s.set.top then
           stop_scroll(s) -- scrolled by the user: it stays where they put it
         end
         send_view(s)
       end
-      if s.kind == "split" and cfg.follow then
+      if (s.kind == "split" and cfg.follow) or (s.kind == "reader" and pwin) then
         local win = source_win(s)
         if win and scrolled[tostring(win)] then
           follow(s)
@@ -1084,6 +1031,9 @@ local function start(s)
   })
   au({ "WinResized", "VimResized" }, {
     callback = debounced(s, 50, function()
+      if s.kind == "reader" then
+        check_page(s)
+      end
       send_size(s)
     end),
   })
@@ -1187,146 +1137,108 @@ function M.open(buf)
   end
 end
 
---- Show `buf` (default: the current buffer) as a page in its own window:
---- `i`, `a`, `I`, `A`, `o` and `O` edit the source at the cursor until Insert
---- mode is left, <CR> shows the source until <Esc>.
+--- Read `buf` (default: the current buffer): lay the page over its window,
+--- following the cursor, until the text changes, a mode other than Normal
+--- and the command line is entered, or `unread`.
 function M.read(buf)
   local s = session_of(buf)
-  if s and s.kind == "reader" then
-    return
-  elseif s then
-    buf = s.buf
-    close_session(s)
-  end
-  buf = current_buf(buf)
+  buf = s and s.buf or current_buf(buf)
   local win = vim.api.nvim_get_current_win()
   if vim.api.nvim_win_get_buf(win) ~= buf then
     win = vim.fn.bufwinid(buf)
   end
-  if win == -1 then
+  if win == -1 or vim.api.nvim_win_get_config(win).relative ~= "" then
     return
+  end
+  vim.b[buf].termd_reader = nil
+  if s and s.kind == "reader" then
+    -- termd still runs from reading before.
+    if valid_win(s.pwin) and s.swin ~= win then
+      hide_page(s)
+    end
+    show_page(s, win)
+    return
+  elseif s then
+    close_session(s)
   end
   s = new_session(buf, "reader")
   if not s then
     return
   end
-  local pbuf = s.pbuf
-  s.win, s.state = win, "source"
-  vim.b[buf].termd_reader = nil
-  -- The two buffers take turns in the window, whatever 'hidden' says; and
-  -- writing the page writes the file.
-  s.bufhidden = vim.bo[buf].bufhidden
-  vim.bo[buf].bufhidden = "hide"
-  vim.bo[pbuf].bufhidden = "hide"
-  vim.bo[pbuf].buftype = "acwrite"
-  to_page(s)
-  if s.state ~= "page" or not start(s) then
+  vim.bo[s.pbuf].bufhidden = "hide"
+  show_page(s, win)
+  if not s.pwin or not start(s) then
     close_session(s)
     return
   end
 
   local au = s.au
-  au("BufWriteCmd", {
-    buffer = pbuf,
-    callback = function(ev)
-      local bang = vim.v.cmdbang == 1 and "!" or ""
-      -- (`:w` alone names the page's buffer; `:w FILE` another file.)
-      local file = ev.match ~= vim.api.nvim_buf_get_name(pbuf) and " " .. vim.fn.fnameescape(ev.match) or ""
-      local ok, err = pcall(vim.api.nvim_buf_call, buf, function()
-        vim.cmd("write" .. bang .. file)
-      end)
-      if not ok then
-        vim.api.nvim_echo({ { (tostring(err):gsub("^.-(E%d+:)", "%1")), "ErrorMsg" } }, true, {})
-      end
-      mirror_modified(s)
-    end,
-  })
-  au({ "BufModifiedSet", "TextChanged", "TextChangedI", "BufWritePost" }, {
-    buffer = buf,
-    callback = function()
-      mirror_modified(s)
-    end,
-  })
   au("CursorMoved", {
-    buffer = pbuf,
-    callback = function()
-      note_anchor(s)
-    end,
-  })
-  au({ "CursorMoved", "CursorMovedI" }, {
     buffer = buf,
     callback = function()
-      prefetch(s)
+      if s.pwin then
+        follow(s)
+      end
     end,
   })
-  -- Back in Normal mode after `i` and the like: back to the page. (Later,
-  -- as CTRL-O and snippets only pass through Normal mode.)
-  au("ModeChanged", {
-    pattern = "*:n",
+  -- Changing the text is editing: the source shows. (Not when writing
+  -- formats it.)
+  au("BufWritePost", {
+    buffer = buf,
     callback = function()
-      if s.state ~= "edit" or vim.api.nvim_get_current_win() ~= s.win then
-        return
+      s.written = vim.api.nvim_buf_get_changedtick(buf)
+    end,
+  })
+  au("TextChanged", {
+    buffer = buf,
+    callback = function()
+      if s.pwin and vim.api.nvim_buf_get_changedtick(buf) ~= s.written then
+        hide_page(s)
       end
+    end,
+  })
+  -- So is Insert, Visual or Replace mode, or an operator; the command line
+  -- (`:w`, a search) is not.
+  au("ModeChanged", {
+    pattern = "n:*",
+    callback = function()
+      local mode = vim.v.event.new_mode or ""
+      if s.pwin and not mode:match("^c") and vim.api.nvim_get_current_win() == s.swin then
+        hide_page(s)
+      end
+    end,
+  })
+  au("WinResized", {
+    callback = function()
+      check_page(s)
+    end,
+  })
+  au({ "BufEnter", "WinEnter", "WinClosed" }, {
+    callback = function()
       vim.schedule(function()
-        if sessions[buf] == s and s.state == "edit" and vim.api.nvim_get_mode().mode == "n" then
-          to_page(s)
+        if sessions[buf] == s then
+          check_page(s)
         end
       end)
     end,
   })
-  au({ "BufEnter", "WinClosed" }, {
-    callback = function()
-      if s.swapping or s.reconciling then
-        return
-      end
-      s.reconciling = true
-      vim.schedule(function()
-        s.reconciling = false
-        reconcile(s)
-      end)
-    end,
-  })
+end
 
-  local escape = vim.api.nvim_replace_termcodes("<Esc>", true, false, true)
-  vim.keymap.set("n", "<Esc>", function()
-    if sessions[buf] == s and vim.api.nvim_get_current_win() == s.win then
-      to_page(s)
-    else
-      vim.api.nvim_feedkeys(escape, "n", false)
-    end
-  end, { buffer = buf, desc = "Back to the page" })
-
-  local map = function(lhs, fn, desc)
-    vim.keymap.set("n", lhs, fn, { buffer = pbuf, nowait = true, desc = desc })
+--- Stop reading `buf` (default: the current buffer): the source shows, its
+--- cursor where the page had it. termd keeps running, to read again soon.
+function M.unread(buf)
+  local s = session_of(buf)
+  if s and s.kind == "reader" then
+    hide_page(s)
   end
-  for _, key in ipairs({ "i", "a", "I", "A", "o", "O" }) do
-    map(key, function()
-      to_source(s, key)
-    end, "Edit the source here")
-  end
-  for _, lhs in ipairs({ "<CR>", "e", "<2-LeftMouse>" }) do
-    map(lhs, function()
-      to_source(s)
-    end, "Show the source here")
-  end
-  map("u", function()
-    in_source(s, "undo")
-  end, "Undo")
-  map("<C-r>", function()
-    in_source(s, "redo")
-  end, "Redo")
 end
 
 --- From the preview, move the cursor in the source window to what the
---- preview's cursor is on, at the same height in the window. (For a reader,
---- show the source there.)
+--- preview's cursor is on, at the same height in the window. (A reader's
+--- cursor is in the source already.)
 function M.jump(buf)
   local s = session_of(buf)
-  if not s then
-    return
-  elseif s.kind == "reader" then
-    return to_source(s)
-  elseif not valid_win(s.pwin) then
+  if not s or s.kind == "reader" or not valid_win(s.pwin) then
     return
   end
   local cursor = vim.api.nvim_win_get_cursor(s.pwin)
@@ -1345,18 +1257,21 @@ function M.jump(buf)
 end
 
 --- Close the preview of `buf` (default: the current buffer, or the buffer
---- previewed in the current window). A reader's buffer then stays as source
---- until `read` is called for it.
+--- previewed in the current window). A reader stops reading, and termd.
 function M.close(buf)
   local s = session_of(buf)
   if s then
     if s.kind == "reader" and vim.api.nvim_buf_is_valid(s.buf) then
       vim.b[s.buf].termd_reader = false
-      -- The source shows what the page showed, at the same height.
-      to_source(s)
     end
     close_session(s)
   end
+end
+
+--- Whether the page is read over `win` (default: the current window).
+function M.reading(win)
+  win = (win == nil or win == 0) and vim.api.nvim_get_current_win() or win
+  return reading_in(win) ~= nil
 end
 
 function M.is_open(buf)
@@ -1371,8 +1286,8 @@ function M.toggle(buf)
   end
 end
 
---- With `reader` set: show `buf` as a page if it is a Markdown file in the
---- current window that has not been shown as source on purpose.
+--- With `reader` set: read `buf` if it is a Markdown file just opened in the
+--- current window. (Once: a file left for its source stays that way.)
 local function auto_read(buf)
   if vim.v.vim_did_enter == 0 then
     -- No screen yet to know the size of.
@@ -1394,19 +1309,72 @@ local function auto_read(buf)
       and vim.bo[buf].filetype == "markdown"
       and vim.bo[buf].buftype == ""
       and vim.b[buf].termd_reader ~= false
+      and not vim.b[buf].termd_opened
       and not session_of(buf)
       and vim.api.nvim_win_get_config(win).relative == ""
       and not vim.wo[win].diff
       and vim.api.nvim_get_mode().mode == "n"
     then
+      vim.b[buf].termd_opened = true
       M.read(buf)
     end
   end)
 end
 
+--- Map `read_key` in Normal mode in Markdown buffer `buf`, unless the
+--- buffer has a mapping of its own for it.
+local function map_read_key(buf)
+  local key = M.config.read_key
+  if not key or key == "" or not vim.api.nvim_buf_is_valid(buf) or vim.b[buf].termd_read_key then
+    return
+  end
+  local own = vim.api.nvim_buf_call(buf, function()
+    return vim.fn.maparg(key, "n", false, true)
+  end)
+  if own.buffer == 1 then
+    return
+  end
+  vim.b[buf].termd_read_key = true
+  local raw = vim.api.nvim_replace_termcodes(key, true, false, true)
+  vim.keymap.set("n", key, function()
+    local win = vim.api.nvim_get_current_win()
+    local s = session_of(buf)
+    if
+      not (s and s.kind == "split")
+      and vim.b[buf].termd_reader ~= false
+      and vim.bo[buf].buftype == ""
+      and vim.api.nvim_win_get_config(win).relative == ""
+      and not vim.wo[win].diff
+      and vim.fn.reg_executing() == ""
+    then
+      M.read(buf)
+    else
+      vim.api.nvim_feedkeys(raw, "n", false)
+    end
+  end, { buffer = buf, desc = "Read the page (termd)" })
+end
+
+local function define_highlights()
+  vim.api.nvim_set_hl(0, "TermdCursor", { default = true, link = "Title" })
+end
+
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts or {})
   local group = vim.api.nvim_create_augroup("termd_reader", { clear = true })
+  if M.config.read_key then
+    vim.api.nvim_create_autocmd("FileType", {
+      group = group,
+      pattern = "markdown",
+      callback = function(ev)
+        map_read_key(ev.buf)
+      end,
+    })
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].filetype == "markdown" then
+        map_read_key(buf)
+      end
+    end
+  end
   if M.config.reader then
     vim.api.nvim_create_autocmd({ "BufWinEnter", "FileType" }, {
       group = group,
@@ -1421,8 +1389,11 @@ end
 M._cell_size = cell_size
 M._sessions = sessions
 
+define_highlights()
+local group = vim.api.nvim_create_augroup("termd", { clear = true })
+vim.api.nvim_create_autocmd("ColorScheme", { group = group, callback = define_highlights })
 vim.api.nvim_create_autocmd("VimLeavePre", {
-  group = vim.api.nvim_create_augroup("termd", { clear = true }),
+  group = group,
   callback = function()
     for _, s in pairs(sessions) do
       close_session(s, true)

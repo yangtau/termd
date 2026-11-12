@@ -39,18 +39,23 @@ COMMANDS                                                      *termd-commands*
     Preview the current buffer in a window next to it.
 
 :TermdRead                                                        *:TermdRead*
-    Show the current buffer as a page in its own window (|termd-reader|).
+    Read the current buffer: lay the page over its window, following the
+    cursor, until `q` or editing (|termd-reader|). <Esc> in Normal mode does
+    the same in a Markdown buffer (`read_key`).
 
 :TermdClose                                                      *:TermdClose*
     Close the preview of the current buffer (or the one shown in the current
-    window). After a reader the buffer stays as source until |:TermdRead|.
+    window). For a reader: stop reading, and stop termd; `read_key` no
+    longer reads in this buffer until |:TermdRead|.
 
 :TermdToggle                                                    *:TermdToggle*
     Open or close the current buffer's preview.
 
 The same from Lua: `require("termd").open()`, `.read()`, `.close()`,
-`.toggle()`, `.is_open()`; each takes an optional buffer number. `.jump()`
-does what <CR> does in the preview.
+`.toggle()`, `.is_open()`; each takes an optional buffer number.
+`.unread()` stops reading; `.reading()` tells whether the page lies over
+the current window (or the one given).
+`.jump()` does what <CR> does in the preview.
 
 ==============================================================================
 SETUP                                                            *termd-setup*
@@ -68,13 +73,15 @@ Calling setup() is optional. The defaults: >lua
       smooth = 120,         -- ms the preview takes to catch up; 0 jumps
       debounce = 100,       -- ms after the last change before updating
       cell_size = nil,      -- { w, h } pixels, if the terminal does not say
-      reader = false,       -- open Markdown files as a page (|termd-reader|)
+      reader = true,        -- open Markdown files reading (|termd-reader|)
+      read_key = "<Esc>",   -- key in Normal mode that reads; false for none
     })
 <
 With lazy.nvim: >lua
 
     {
       "yangtau/termd",
+      ft = "markdown",      -- for `reader`: loaded when a Markdown file opens
       cmd = { "TermdOpen", "TermdRead", "TermdClose", "TermdToggle" },
       keys = { { "<leader>mp", "<cmd>TermdToggle<cr>", desc = "Markdown preview" } },
       opts = {},
@@ -106,32 +113,43 @@ the source window moves again.
 ==============================================================================
 READER                                                          *termd-reader*
 
-|:TermdRead| shows the buffer as a page in the window it is in, and with >lua
+Reading is a mode of its own for a Markdown buffer, one level out from
+Normal mode: <Esc> in Normal mode reads (so <Esc> twice from Insert mode),
+and |:TermdRead| does too. The page then lies over the source's window,
+which keeps the buffer and the focus: move the cursor and scroll as in the
+source (j, CTRL-D, gg, /, n, the mouse wheel) and the page follows, as a
+preview follows its source window (|termd-scrolling|); a mark at its left
+edge is the row the cursor is on. <Esc> does nothing more, so pressing it
+once too often stays put. The source shows again, its cursor where it was,
+with:
 
-    require("termd").setup({ reader = true })
-<
-every Markdown file opens that way. The page is read in Normal mode: move
-and scroll as in any buffer. To change the text:
+    q <CR>          Stop reading.
+    i a o v d c     Anything that leaves Normal mode for another mode than
+    ...             the command line (Insert, Visual, an operator), or
+                    changes the text (x, p, u, :s): you are editing.
 
-    i a I A o O     Edit the source at the page's cursor: the window shows
-                    the source, with the cursor on the character the page's
-                    cursor was on, in Insert mode. Leaving Insert mode
-                    brings the page back.
-    <CR> or e       Show the source and stay in it, for Normal mode commands
-                    (dd, Visual mode, :s). <Esc> in Normal mode brings the
-                    page back.
-    u CTRL-R        Undo and redo.
+`:w`, searches and other commands on the command line keep reading. As the
+window still has the file, whatever goes by the current buffer finds it: a
+file tree (neo-tree reveals the file), the status line, `:w`, CTRL-^.
 
-What the cursor is on stays at the height in the window it was at, both
-ways. `:w` in the page writes the file; the page counts as modified when the
-file's buffer is. |:TermdClose| goes back to the plain source for this
-buffer.
+termd keeps running in between, so the page comes back at once
+(|:TermdClose| stops it, and <Esc> reads again only after |:TermdRead|).
+<Esc> reads only in a plain window: not while the buffer has a preview next
+to it (|:TermdOpen|), in a diff, in a floating window or while a macro runs.
+Set `read_key` to another key, or to false to read only with |:TermdRead|;
+with another key <Esc> also stops reading.
 
-The plugin has to be loaded for `reader` to do anything: with lazy.nvim, add
+With `reader` (the default) a Markdown file opens reading, the first time
+it shows: a file left for its source stays so when you come back to it. Set
+`reader = false` to open files as source. The plugin has to be loaded for
+`reader` and `read_key` to do anything: with lazy.nvim, add
 `ft = "markdown"` to its spec.
 
-The page is a picture: there is no searching in it (`/` sees the source after
-<CR>), and its cursor moves by cells, not by words.
+Neovim has no way to add a mode of its own, so the mode indicator still
+says NORMAL. A status line can show reading with
+`require("termd").reading()`, true for a window the page lies over. The
+terminal's cursor is hidden there in Normal mode (|guicursor|, with a
+highlight of `blend` 100); `TermdCursor` colors the mark.
 
 ==============================================================================
 HOW IT WORKS                                                       *termd-how*
