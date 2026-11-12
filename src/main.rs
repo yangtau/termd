@@ -14,6 +14,7 @@ mod fonts;
 mod highlight;
 mod kitty;
 mod open;
+mod serve;
 mod source;
 mod term;
 mod theme;
@@ -73,6 +74,12 @@ pub struct Cli {
     /// Skip the Kitty graphics support check
     #[arg(long)]
     force: bool,
+
+    /// Render for an editor plugin that shows the page in its own window:
+    /// read commands on stdin, write images for the editor to pass on to
+    /// the terminal (see src/serve.rs)
+    #[arg(long)]
+    serve: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -117,7 +124,8 @@ fn main() -> Result<()> {
     // of starting up when it is not cached, so it runs while the file is
     // read and the terminal is probed.
     let scan = std::thread::spawn(fonts::scan);
-    let source = read_source(&cli.file)?;
+    // An editor sends the text it has, which may not have been saved yet.
+    let source = if cli.serve { String::new() } else { read_source(&cli.file)? };
     // Likewise syntax highlighting, which has its own thread.
     let mut highlighter = highlight::Highlighter::new();
     doc::prepare_highlighting(&mut highlighter, &source);
@@ -146,6 +154,11 @@ fn main() -> Result<()> {
         page.save(out).with_context(|| format!("writing {}", out.display()))?;
         trace.print();
         return Ok(());
+    }
+
+    if cli.serve {
+        let engine = engine(&mut trace)?;
+        return serve::run(&cli.file, engine, zoom, cli.theme.dark());
     }
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {

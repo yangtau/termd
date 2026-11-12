@@ -844,7 +844,6 @@ impl Doc {
 
     /// Page offset of the text that comes from 1-based source `line` (or the
     /// first text after it).
-    #[cfg(test)]
     pub fn offset_of_line(&mut self, eng: &mut Engine, line: u32) -> u32 {
         self.resolve(eng, Anchor { src: self.start_of_line(line), frac: 0.0 })
     }

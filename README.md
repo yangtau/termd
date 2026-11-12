@@ -79,6 +79,56 @@ environment.systemPackages = [ inputs.termd.packages.${pkgs.system}.default ];
   （比例字体，尤其是衬线字体，太小了不好看）。
 - `--no-smooth-scroll`：滚动时直接跳到目标位置，不做动画（比如通过很慢的 SSH 连接使用时）。
 - `--export out.png [--width 1200] [--font-size 16]`：不进入交互界面，直接把整页导出为 PNG。
+- `--serve`：给编辑器插件用（见下一节）。不打开自己的界面，从 stdin 读命令、把图像通过 stdout 交给编辑器，
+  由编辑器转发给终端。协议见 `src/serve.rs`。
+
+## Neovim 插件
+
+仓库本身就是一个 Neovim 插件（Neovim 0.9+）：`:TermdOpen` / `:TermdClose` / `:TermdToggle`
+在当前窗口旁边分出一个 Neovim 窗口，渲染好的页面就显示在这个窗口里。
+
+- 预览窗口是普通的 Neovim 窗口：可以用 `<C-d>`、`gg`、鼠标滚轮滚动，可以调整大小、换位置、放进新的标签页；
+- 预览的是缓冲区当前的内容，没保存的修改边打边更新；
+- 预览跟着光标滚动，光标所在行在预览里和在编辑器窗口里处于同样的高度；
+- 在预览窗口里按 `<CR>`（或 `e`、双击），源码窗口的光标跳到对应的行；按 `q` 关闭；
+- 删除缓冲区、关掉预览窗口或退出 Neovim 时，预览自动关闭。
+
+原理：预览缓冲区里填的是 Kitty 图像协议的 Unicode 占位符（U+10EEEE 加上表示行号、列号的组合字符），
+终端把这些字符格换成图像的对应部分，用哪张图由字符的前景色决定。滚动、重绘都由 Neovim 自己完成，
+termd（`--serve`）只负责排版、按需渲染进入视野的那几块，再把图像交给插件写给终端。
+
+要求：
+
+- 终端支持 Unicode 占位符：kitty（0.28+）、Ghostty。WezTerm 不支持。
+- `termguicolors` 打开（图像是用前景色区分的）。
+- tmux 里需要 `set -g allow-passthrough on`，外层终端同样得是 kitty 或 Ghostty。
+- 图像在本机通过共享内存（kitty）或临时文件（其他终端）传给终端，写进终端的只是很短的转义序列。
+  通过 SSH 时只能把像素内嵌在转义序列里，由于 Neovim 的界面进程同时也在往终端写，屏幕更新很频繁时
+  偶尔会出现乱码或缺块，按 `<C-l>` 重绘即可。
+
+用 lazy.nvim 安装：
+
+```lua
+{
+  "yangtau/termd",
+  cmd = { "TermdOpen", "TermdClose", "TermdToggle" },
+  keys = { { "<leader>mp", "<cmd>TermdToggle<cr>", desc = "Markdown preview" } },
+  opts = {
+    -- 下面都是默认值
+    cmd = "termd",        -- termd 可执行文件
+    args = {},            -- 额外参数，比如 { "--sans", "--zoom", "0.9" }
+    position = "right",   -- right / left / bottom / top / tab
+    size = nil,           -- 窗口宽度（上下分屏时是高度），单位是字符格；默认占一半
+    focus = false,        -- 打开后焦点是否移到预览窗口
+    live = true,          -- 预览未保存的修改
+    follow = true,        -- 跟随光标滚动
+    debounce = 100,       -- 停止输入多少毫秒后更新
+    cell_size = nil,      -- 终端没报告字符格像素尺寸时手动指定，如 { 10, 21 }
+  },
+}
+```
+
+完整说明见 `:help termd`，出问题时可以运行 `:checkhealth termd`。
 
 ## 支持的语法
 
@@ -130,6 +180,8 @@ YAML front matter（显示为页首的属性表）。
   再放置一次（叠在最上层，下面垫一块背景色），都不需要重新上传像素。
 - `src/kitty.rs`：协议编码。终端和 termd 在同一台机器上并且支持时，像素通过 POSIX 共享内存传给终端
   （启动时探测，kitty 支持）；否则用 zlib 压缩 + base64 内嵌在转义序列里（比如通过 SSH）。
+- `src/serve.rs`：给编辑器插件用的渲染模式（`--serve`）。整页按约 512px 高、行数为整数的块渲染，
+  每块是一张图，编辑器窗口里显示到哪些行就渲染、上传哪些块，离得远的块会从终端里释放。
 - `src/term.rs`：启动时探测终端的前景 / 背景色、图像协议支持、共享内存支持和窗口像素尺寸。
 - `src/theme.rs`：配色，全部由终端的前景色和背景色混合得到。
 

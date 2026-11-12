@@ -1,0 +1,98 @@
+*termd.txt*  Preview Markdown with termd, in a Neovim window
+
+==============================================================================
+INTRODUCTION                                                           *termd*
+
+Shows the current Markdown buffer as a rendered page, drawn by termd
+(https://github.com/yangtau/termd), in a Neovim window next to it.
+
+  - The preview is an ordinary window: scroll it with CTRL-D, gg, the mouse
+    wheel; resize it, move it, put it in a tab page.
+  - It shows the buffer as it is, unsaved changes included, as you type.
+  - It scrolls along with the cursor, keeping the cursor's line at the same
+    height as in the editor window.
+  - <CR> in the preview (or `e`, or a double click) moves the cursor in the
+    source window to the line shown there; `q` closes the preview.
+  - It closes when the buffer is deleted, its window is closed, or Neovim
+    exits.
+
+Requirements:
+
+  - A terminal with Kitty Unicode placeholders: kitty 0.28 or newer, or
+    Ghostty. WezTerm does not have them.
+  - 'termguicolors'.
+  - Inside tmux: `set -g allow-passthrough on`, and kitty or Ghostty
+    outside of it.
+  - Neovim 0.9 or newer, and a termd that has `--serve`.
+
+Images reach a terminal on the same machine through shared memory (kitty)
+or temporary files (others), so only short escape sequences are written to
+it. Over SSH the pixels have to go inline; as Neovim's UI writes to the same
+terminal at the same time, a busy screen can then end up with stray
+characters or a missing piece. CTRL-L draws it again.
+
+==============================================================================
+COMMANDS                                                      *termd-commands*
+
+:TermdOpen                                                        *:TermdOpen*
+    Preview the current buffer.
+
+:TermdClose                                                      *:TermdClose*
+    Close the preview of the current buffer (or the one shown in the current
+    window).
+
+:TermdToggle                                                    *:TermdToggle*
+    Open or close the current buffer's preview.
+
+The same from Lua: `require("termd").open()`, `.close()`, `.toggle()`,
+`.is_open()`; each takes an optional buffer number. `.jump()` does what <CR>
+does in the preview.
+
+==============================================================================
+SETUP                                                            *termd-setup*
+
+Calling setup() is optional. The defaults: >lua
+
+    require("termd").setup({
+      cmd = "termd",        -- the executable
+      args = {},            -- extra arguments, e.g. { "--sans", "--zoom", "0.9" }
+      position = "right",   -- "right", "left", "bottom", "top", "tab"
+      size = nil,           -- width (height for bottom/top) in cells; half if nil
+      focus = false,        -- move the focus to the preview when it opens
+      live = true,          -- preview unsaved changes
+      follow = true,        -- scroll along with the cursor
+      debounce = 100,       -- ms after the last change before updating
+      cell_size = nil,      -- { w, h } pixels, if the terminal does not say
+    })
+<
+With lazy.nvim: >lua
+
+    {
+      "yangtau/termd",
+      cmd = { "TermdOpen", "TermdClose", "TermdToggle" },
+      keys = { { "<leader>mp", "<cmd>TermdToggle<cr>", desc = "Markdown preview" } },
+      opts = {},
+    }
+<
+The text is set at the height of a terminal line; `--zoom` in `args`
+changes that. The preview buffer has 'filetype' `termd`.
+
+==============================================================================
+HOW IT WORKS                                                       *termd-how*
+
+The preview buffer is filled with Kitty Unicode placeholders: U+10EEEE with
+combining marks that number a row and a column of an image. The terminal
+draws the image there instead of text, picking it by the cell's foreground
+color. So Neovim scrolls and redraws the preview like any other text.
+
+`termd --serve FILE` lays out the page at the window's width (FILE only says
+where links and images are found) and renders it in chunks of rows, each an
+image of its own. The plugin sends it the buffer's text and the rows the
+window shows; termd answers with the escape sequences for the chunks in and
+near view, which the plugin writes to the terminal. It also tells which row a
+source line is at, and the other way round. See src/serve.rs for the
+protocol.
+
+Run |:checkhealth| termd when something does not work.
+
+ vim:tw=78:ts=8:ft=help:norl:

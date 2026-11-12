@@ -10,6 +10,7 @@ use flate2::{Compression, write::ZlibEncoder};
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Uploads images, through shared memory when the terminal runs on this
@@ -20,16 +21,30 @@ use std::time::{Duration, Instant};
 /// directly.
 pub struct Uploader {
     shm: bool,
+    /// Pass images in temporary files in this directory instead (when not
+    /// through shared memory).
+    files: Option<PathBuf>,
     seq: u32,
     /// Objects handed to the terminal. It unlinks each one after reading it;
     /// ours is a safety net in case it never does.
     handed: VecDeque<(CString, Instant)>,
+    handed_files: VecDeque<(PathBuf, Instant)>,
 }
 
 impl Uploader {
     /// `shm`: whether the terminal answered the shared memory probe.
     pub fn new(shm: bool) -> Uploader {
-        Uploader { shm, seq: 0, handed: VecDeque::new() }
+        Uploader { shm, files: None, seq: 0, handed: VecDeque::new(), handed_files: VecDeque::new() }
+    }
+
+    /// Pass images in temporary files in `dir` (which the terminal must
+    /// accept as a temporary directory), for a terminal on this machine
+    /// that may not do shared memory. Escape sequences stay short, which
+    /// matters when they share the terminal with another program's output.
+    pub fn with_files(dir: PathBuf) -> Uploader {
+        let mut uploader = Uploader::new(false);
+        uploader.files = Some(dir);
+        uploader
     }
 
     pub fn uses_shm(&self) -> bool {
@@ -51,6 +66,21 @@ impl Uploader {
             }
             self.shm = false; // e.g. /dev/shm is full; stay inline from now on
         }
+        if let Some(dir) = &self.files {
+            self.seq += 1;
+            // The terminal deletes a file passed this way once it has read
+            // it, if its name says it is meant for that.
+            let path = dir.join(format!("tty-graphics-protocol-termd-{}-{}", std::process::id(), self.seq));
+            if std::fs::write(&path, rgba).is_ok() {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(path.as_os_str().as_encoded_bytes());
+                let size = rgba.len();
+                let _ = write!(out, "\x1b_Ga=t,f=32,t=t,q=2,i={id},s={width},v={height},S={size};{b64}\x1b\\");
+                self.handed_files.push_back((path, Instant::now()));
+                return;
+            }
+            let _ = std::fs::remove_file(&path);
+            self.files = None; // e.g. the disk is full; stay inline from now on
+        }
         transmit_inline(out, id, width, height, rgba);
     }
 
@@ -59,6 +89,11 @@ impl Uploader {
         while self.handed.front().is_some_and(|(_, at)| at.elapsed() >= age) {
             if let Some((name, _)) = self.handed.pop_front() {
                 shm_unlink(&name);
+            }
+        }
+        while self.handed_files.front().is_some_and(|(_, at)| at.elapsed() >= age) {
+            if let Some((path, _)) = self.handed_files.pop_front() {
+                let _ = std::fs::remove_file(path);
             }
         }
     }
