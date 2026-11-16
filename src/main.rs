@@ -192,6 +192,14 @@ pub fn read_source(path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Body font size for a terminal whose lines are `cell_h` pixels high. A
+/// line is about a fifth taller than the terminal's font size; the body text
+/// is set at about that font size, so the page reads like the rest of the
+/// terminal. Tracks HiDPI scaling, as the cell does.
+pub fn body_px(cell_h: u32, zoom: f32) -> f32 {
+    (cell_h as f32 * 0.85 * zoom).max(6.0)
+}
+
 pub fn base_dir(file: &Path) -> PathBuf {
     match file.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),

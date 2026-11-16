@@ -1,21 +1,16 @@
-*termd.txt*  Preview Markdown with termd, in a Neovim window
+*termd.txt*  Read Markdown with termd, in a Neovim window
 
 ==============================================================================
 INTRODUCTION                                                           *termd*
 
 Shows the current Markdown buffer as a rendered page, drawn by termd
-(https://github.com/yangtau/termd), in a Neovim window: one next to the
-buffer's (|:TermdOpen|), or the buffer's own, where page and source take
-turns (|termd-reader|).
+(https://github.com/yangtau/termd), laid over the buffer's own window: page
+and source take turns there (|termd-reader|).
 
-  - The preview is an ordinary window: scroll it with CTRL-D, gg, the mouse
-    wheel; resize it, move it, put it in a tab page.
-  - It shows the buffer as it is, unsaved changes included, as you type.
-  - It scrolls along with the source window (|termd-scrolling|).
-  - <CR> in the preview (or `e`, or a double click) moves the cursor in the
-    source window to what the preview's cursor is on; `q` closes the preview.
-  - It closes when the buffer is deleted, its window is closed, or Neovim
-    exits.
+  - It shows the buffer as it is, unsaved changes included.
+  - It follows the cursor and the source window (|termd-scrolling|).
+  - termd stops when the buffer is deleted, with |:TermdClose|, or when
+    Neovim exits.
 
 Requirements:
 
@@ -35,27 +30,19 @@ characters or a missing piece. CTRL-L draws it again.
 ==============================================================================
 COMMANDS                                                      *termd-commands*
 
-:TermdOpen                                                        *:TermdOpen*
-    Preview the current buffer in a window next to it.
-
 :TermdRead                                                        *:TermdRead*
     Read the current buffer: lay the page over its window, following the
     cursor, until `q` or editing (|termd-reader|). <Esc> in Normal mode does
     the same in a Markdown buffer (`read_key`).
 
 :TermdClose                                                      *:TermdClose*
-    Close the preview of the current buffer (or the one shown in the current
-    window). For a reader: stop reading, and stop termd; `read_key` no
-    longer reads in this buffer until |:TermdRead|.
+    Stop reading the current buffer, and stop termd; `read_key` no longer
+    reads in this buffer until |:TermdRead|.
 
-:TermdToggle                                                    *:TermdToggle*
-    Open or close the current buffer's preview.
-
-The same from Lua: `require("termd").open()`, `.read()`, `.close()`,
-`.toggle()`, `.is_open()`; each takes an optional buffer number.
-`.unread()` stops reading; `.reading()` tells whether the page lies over
-the current window (or the one given).
-`.jump()` does what <CR> does in the preview.
+The same from Lua: `require("termd").read()`, `.close()`; each takes an
+optional buffer number. `.unread()` stops reading and leaves termd running;
+`.reading()` tells whether the page lies over the current window (or the
+one given); `.is_open()` whether termd runs for the buffer.
 
 ==============================================================================
 SETUP                                                            *termd-setup*
@@ -65,13 +52,7 @@ Calling setup() is optional. The defaults: >lua
     require("termd").setup({
       cmd = "termd",        -- the executable
       args = {},            -- extra arguments, e.g. { "--sans", "--zoom", "0.9" }
-      position = "right",   -- "right", "left", "bottom", "top", "tab"
-      size = nil,           -- width (height for bottom/top) in cells; half if nil
-      focus = false,        -- move the focus to the preview when it opens
-      live = true,          -- preview unsaved changes
-      follow = true,        -- scroll along with the source window
-      smooth = 120,         -- ms the preview takes to catch up; 0 jumps
-      debounce = 100,       -- ms after the last change before updating
+      smooth = 120,         -- ms the page takes to catch up; 0 jumps
       cell_size = nil,      -- { w, h } pixels, if the terminal does not say
       reader = true,        -- open Markdown files reading (|termd-reader|)
       read_key = "<Esc>",   -- key in Normal mode that reads; false for none
@@ -82,33 +63,29 @@ With lazy.nvim: >lua
     {
       "yangtau/termd",
       ft = "markdown",      -- for `reader`: loaded when a Markdown file opens
-      cmd = { "TermdOpen", "TermdRead", "TermdClose", "TermdToggle" },
-      keys = { { "<leader>mp", "<cmd>TermdToggle<cr>", desc = "Markdown preview" } },
+      cmd = { "TermdRead", "TermdClose" },
       opts = {},
     }
 <
-The text is set at the height of a terminal line; `--zoom` in `args`
-changes that. The preview buffer has 'filetype' `termd`.
+The text is about the size of the terminal's own (0.85 of a line's
+height); `--zoom` in `args` changes that. The page's buffer has 'filetype' `termd`.
 
 ==============================================================================
 SCROLLING                                                    *termd-scrolling*
 
-The preview follows the source window, not only the cursor. The lines the
+The page follows the source window, not only the cursor. The lines the
 source window shows are a stretch of the page, as a rule a longer one than
-the preview is high. With the cursor on the first row of the source window
-both windows start with the same text, with the cursor on the last row both
-end with it, and in between the preview slides from the one to the other. So
-the cursor's line is at about the same height in both windows, a step of the
-cursor moves the preview by the same small amount whatever the line looks
-like on the page, and scrolling the source window (CTRL-E, the mouse wheel)
-scrolls the preview too. The place the cursor is at always shows.
+the window is high. With the cursor on the first row of the source window
+page and source start with the same text, with the cursor on the last row
+both end with it, and in between the page slides from the one to the other.
+So the cursor's line is at about the same height in both, a step of the
+cursor moves the page by the same small amount whatever the line looks like
+on the page, and scrolling the source window (CTRL-E, the mouse wheel)
+scrolls the page too. The place the cursor is at always shows.
 
-When the preview has more than a row to go it scrolls there over a few
-frames (`smooth`, in milliseconds; 0 turns that off). A long jump (gg, a
-search) shows only the last screenful of the way.
-
-Scrolling the preview itself leaves it where you put it until the cursor or
-the source window moves again.
+When the page has more than a row to go it scrolls there over a few frames
+(`smooth`, in milliseconds; 0 turns that off). A long jump (gg, a search)
+shows only the last screenful of the way.
 
 ==============================================================================
 READER                                                          *termd-reader*
@@ -117,10 +94,9 @@ Reading is a mode of its own for a Markdown buffer, one level out from
 Normal mode: <Esc> in Normal mode reads (so <Esc> twice from Insert mode),
 and |:TermdRead| does too. The page then lies over the source's window,
 which keeps the buffer and the focus: move the cursor and scroll as in the
-source (j, CTRL-D, gg, /, n, the mouse wheel) and the page follows, as a
-preview follows its source window (|termd-scrolling|); a mark at its left
-edge is the row the cursor is on. <Esc> does nothing more, so pressing it
-once too often stays put. The source shows again, its cursor where it was,
+source (j, CTRL-D, gg, /, n, the mouse wheel) and the page follows
+(|termd-scrolling|); a mark at its left edge is the row the cursor is on.
+<Esc> does nothing more, so pressing it once too often stays put. The source shows again, its cursor where it was,
 with:
 
     q <CR>          Stop reading.
@@ -134,9 +110,8 @@ file tree (neo-tree reveals the file), the status line, `:w`, CTRL-^.
 
 termd keeps running in between, so the page comes back at once
 (|:TermdClose| stops it, and <Esc> reads again only after |:TermdRead|).
-<Esc> reads only in a plain window: not while the buffer has a preview next
-to it (|:TermdOpen|), in a diff, in a floating window or while a macro runs.
-Set `read_key` to another key, or to false to read only with |:TermdRead|;
+<Esc> reads only in a plain window: not in a diff, in a floating window or
+while a macro runs. Set `read_key` to another key, or to false to read only with |:TermdRead|;
 with another key <Esc> also stops reading.
 
 With `reader` (the default) a Markdown file opens reading, the first time
@@ -154,19 +129,18 @@ highlight of `blend` 100); `TermdCursor` colors the mark.
 ==============================================================================
 HOW IT WORKS                                                       *termd-how*
 
-The preview buffer is filled with Kitty Unicode placeholders: U+10EEEE with
+The page's buffer is filled with Kitty Unicode placeholders: U+10EEEE with
 combining marks that number a row and a column of an image. The terminal
 draws the image there instead of text, picking it by the cell's foreground
-color. So Neovim scrolls and redraws the preview like any other text.
+color. So Neovim scrolls and redraws the page like any other text.
 
 `termd --serve FILE` lays out the page at the window's width (FILE only says
 where links and images are found) and renders it in chunks of rows, each an
 image of its own. The plugin sends it the buffer's text and the rows the
 window shows; termd answers with the escape sequences for the chunks in and
 near view, which the plugin writes to the terminal. With every page comes a
-map of the row each source line is at, which the plugin scrolls by; and termd
-tells what in the source a cell of the page shows. See src/serve.rs for the
-protocol. Plugin and termd have to be of the same version.
+map of the row each source line is at, which the plugin scrolls by. See
+src/serve.rs for the protocol. Plugin and termd have to be of the same version.
 
 Run |:checkhealth| termd when something does not work.
 

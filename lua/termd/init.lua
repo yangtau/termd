@@ -1,16 +1,15 @@
--- Preview Markdown buffers with termd, inside a Neovim window.
+-- Read Markdown buffers with termd, inside a Neovim window.
 --
 -- termd renders the page (`termd --serve`) and hands over the images, as
 -- Kitty graphics escape sequences that this plugin writes to the terminal.
--- The preview window holds text: Kitty Unicode placeholders, cells that the
+-- The page's window holds text: Kitty Unicode placeholders, cells that the
 -- terminal replaces with part of an image. A cell's foreground color names
 -- the image and two combining marks name the row and column in it. So the
--- window scrolls, splits and redraws like any other; termd is only asked
--- for the rows that come into view.
+-- window scrolls and redraws like any other; termd is only asked for the
+-- rows that come into view.
 --
--- The page is shown in one of two ways: in a window of its own next to the
--- source, which it follows (a "split" session, `open`), or laid over the
--- source's window, following the cursor there (a "reader" session, `read`).
+-- The page is laid over the source's window and follows the cursor there
+-- (reading, `read`).
 --
 -- Needs a terminal with Unicode placeholders (kitty, Ghostty) and
 -- 'termguicolors'.
@@ -21,26 +20,12 @@ local uv = vim.uv or vim.loop
 
 ---@class termd.Config
 local defaults = {
-  -- The termd executable, and arguments for every preview (e.g. { "--sans" }).
+  -- The termd executable, and arguments for every page (e.g. { "--sans" }).
   cmd = "termd",
   args = {},
-  -- Where the preview window opens next to the buffer's: "right", "left",
-  -- "bottom", "top" or "tab".
-  position = "right",
-  -- Width (or height, for "bottom" and "top") of the window in cells; half
-  -- of the current window when nil.
-  size = nil,
-  -- Move the focus to the preview when it opens.
-  focus = false,
-  -- Preview the buffer as it is, not as it was last saved.
-  live = true,
-  -- Scroll the preview along with the source window.
-  follow = true,
-  -- Milliseconds the preview takes to catch up when it has more than a row
-  -- to go; 0 makes it jump.
+  -- Milliseconds the page takes to catch up when it has more than a row to
+  -- go; 0 makes it jump.
   smooth = 120,
-  -- Milliseconds to wait after the last change before updating the preview.
-  debounce = 100,
   -- Size of a terminal cell in pixels, { width, height }, when the
   -- terminal does not report it.
   cell_size = nil,
@@ -54,7 +39,7 @@ local defaults = {
 
 M.config = vim.deepcopy(defaults)
 
----@type table<integer, table> Open previews by source buffer.
+---@type table<integer, table> Sessions (termd running) by source buffer.
 local sessions = {}
 
 local ns = vim.api.nvim_create_namespace("termd")
@@ -217,13 +202,11 @@ local function clamp(value, low, high)
   return math.max(low, math.min(high, value))
 end
 
---- The window showing the source buffer, preferring the one it was opened from.
+--- The window the page lies over, while it shows the source buffer.
 local function source_win(s)
   if valid_win(s.swin) and vim.api.nvim_win_get_buf(s.swin) == s.buf then
     return s.swin
   end
-  local win = vim.fn.bufwinid(s.buf)
-  return win ~= -1 and win or nil
 end
 
 --- The window that shows the page right now, if any.
@@ -308,20 +291,12 @@ local function send_view(s)
   show(s, top, bottom)
 end
 
---- Ask termd something; `fn` gets the numbers of the answer.
-local function ask(s, what, args, fn)
-  s.tag = s.tag + 1
-  s.waiting[tostring(s.tag)] = fn
-  send(s, ("%s %d %s\n"):format(what, s.tag, args))
-end
-
 -- Where the source is on the page ------------------------------------------
 --
 -- With every page termd sends a map: the row at which each source line
 -- starts (with a fraction; a line that shows nothing has its share of the
 -- gap it is in), and the row at which the page ends. Positions between two
--- entries are interpolated, so both directions are continuous and never go
--- back.
+-- entries are interpolated, so they are continuous and never go back.
 
 --- The row (0-based, with a fraction) at which source line `line` (1-based,
 --- with a fraction for a place inside the line) is on the page.
@@ -336,45 +311,7 @@ local function row_of(s, line)
   return map[i] + (line - i) * (map[i + 1] - map[i])
 end
 
---- The source line (with a fraction) that row `row` of the page shows.
-local function line_of(s, row)
-  local map = s.map
-  local lines = map and #map - 1 or 0
-  if lines < 1 then
-    return 1
-  end
-  -- The last line that starts at or above the row.
-  local low, high = 1, lines
-  while low < high do
-    local mid = math.ceil((low + high) / 2)
-    if map[mid] <= row then
-      low = mid
-    else
-      high = mid - 1
-    end
-  end
-  local span = map[low + 1] - map[low]
-  return low + (span > 0 and clamp((row - map[low]) / span, 0, 1) or 0)
-end
-
-M._row_of, M._line_of = row_of, line_of
-
---- What in the source the cell at `row`, `col` of the page shows: the line
---- (1-based) and the byte in it. Waits for termd's answer, so that keys
---- typed meanwhile find the cursor in place.
-local function spot(s, row, col)
-  local line, byte
-  ask(s, "spot", ("%d %d"):format(row, col), function(l, b)
-    line, byte = l or 0, b or 0
-  end)
-  vim.wait(300, function()
-    return line ~= nil
-  end, 2)
-  if line and line > 0 then
-    return line, byte
-  end
-  return math.floor(line_of(s, row + 0.5)), 0
-end
+M._row_of = row_of
 
 -- Scrolling the page ----------------------------------------------------
 
@@ -407,9 +344,9 @@ end
 
 local mark_ns = vim.api.nvim_create_namespace("termd_mark")
 
---- Mark row `row` of a reader's page as the one the cursor is on.
+--- Mark row `row` of the page as the one the cursor is on.
 local function mark(s, row)
-  if s.kind ~= "reader" or not vim.api.nvim_buf_is_valid(s.pbuf) then
+  if not vim.api.nvim_buf_is_valid(s.pbuf) then
     return
   end
   s.mark = vim.api.nvim_buf_set_extmark(s.pbuf, mark_ns, row, 0, {
@@ -449,7 +386,7 @@ local function stop_scroll(s)
   s.target = nil
 end
 
---- One frame of the preview scrolling to `s.target`: a share of the way
+--- One frame of the page scrolling to `s.target`: a share of the way
 --- left, so it starts fast and slows down, but never less than a row per
 --- frame, so it arrives. A new target only changes where it is heading.
 local function scroll_step(s)
@@ -483,7 +420,7 @@ local function scroll_step(s)
   end
 end
 
---- Scroll the preview so that row `top` is its first, with its cursor on
+--- Scroll the page so that row `top` is its first, with its cursor on
 --- row `row`: at once if that is a row away or `jump` is set, else over a
 --- few frames.
 local function scroll_to(s, top, row, jump)
@@ -546,22 +483,22 @@ local function source_view(win)
   return v
 end
 
---- Scroll the preview along with the source window.
+--- Scroll the page along with the source window under it.
 ---
 --- The source window shows some lines and the page has a stretch that
---- shows the same; as a rule that stretch is longer than the preview is
---- high. The preview slides over it as the cursor goes down the source
---- window: with the cursor on the first row, both windows start with the
---- same text; on the last row, both end with it. So the cursor's line is at
---- about the same height in both, and each step of the cursor moves the
---- preview by the same small amount, whatever the line it lands on looks
+--- shows the same; as a rule that stretch is longer than the window is
+--- high. The page slides over it as the cursor goes down the source
+--- window: with the cursor on the first row, page and source start with
+--- the same text; on the last row, both end with it. So the cursor's line
+--- is at about the same height in both, and each step of the cursor moves
+--- the page by the same small amount, whatever the line it lands on looks
 --- like on the page. (Putting the cursor's line at exactly the same height
---- makes the preview jump back and forth: an empty line takes less room on
+--- makes the page jump back and forth: an empty line takes less room on
 --- the page than in the source, a heading more.)
 local function follow(s, jump)
   local win = source_win(s)
   local pwin = s.pwin
-  if not (s.doc and s.map and win and valid_win(pwin)) or vim.api.nvim_get_current_win() == pwin then
+  if not (s.doc and s.map and win and valid_win(pwin)) then
     return
   end
   local v = source_view(win)
@@ -576,7 +513,7 @@ local function follow(s, jump)
   scroll_to(s, top, row, jump)
 end
 
---- Fill the preview buffer with placeholders for `rows` rows, in chunks of
+--- Fill the page's buffer with placeholders for `rows` rows, in chunks of
 --- `chunk` rows that are images `base`, `base + 1`, ... Only the end of the
 --- buffer changes when the page got longer or shorter.
 local function fill(s, rows, chunk, base)
@@ -619,38 +556,17 @@ local function fill(s, rows, chunk, base)
   s.chunks = math.max(s.chunks or 0, chunks)
 end
 
--- The reader --------------------------------------------------------------
+-- Reading ---------------------------------------------------------------
 --
--- A reader session lays the page over the source's window, in a floating
--- window of the same size that cannot be entered (`s.pwin` while reading).
--- The source stays the window's buffer and has the focus: its cursor moves
--- and the page follows it as a preview follows its source window, a mark
--- at the left edge of the page showing where the cursor is. So whatever
--- looks at the current buffer (`:w`, a file tree, the status line, `/`)
--- finds the file. Reading ends when the text is changed or Normal mode
--- left for anything but the command line; `q` and <CR> end it too. termd
--- keeps running in between, so that the page comes back at once.
-
---- The first line to show in `win` for `line` to have `above` screen rows
---- above it.
-local function topline_for(win, line, above)
-  local height = function(lnum)
-    if not vim.api.nvim_win_text_height then
-      return 1
-    end
-    local ok, size = pcall(vim.api.nvim_win_text_height, win, { start_row = lnum - 1, end_row = lnum - 1 })
-    return ok and size.all or 1
-  end
-  local top = line
-  while top > 1 and above > 0 do
-    above = above - height(top - 1)
-    if above < 0 then
-      break
-    end
-    top = top - 1
-  end
-  return top
-end
+-- Reading lays the page over the source's window, in a floating window of
+-- the same size that cannot be entered (`s.pwin` while reading). The
+-- source stays the window's buffer and has the focus: its cursor moves and
+-- the page follows it (`follow`), a mark at the left edge of the page
+-- showing where the cursor is. So whatever looks at the current buffer
+-- (`:w`, a file tree, the status line, `/`) finds the file. Reading ends
+-- when the text is changed or Normal mode left for anything but the
+-- command line; `q` and <CR> end it too. termd keeps running in between,
+-- so that the page comes back at once.
 
 -- The terminal's cursor is in the source window, under the page: hidden
 -- there while it is read (with a highlight that blends it away entirely).
@@ -669,7 +585,7 @@ end
 
 local function reading_in(win)
   for _, s in pairs(sessions) do
-    if s.kind == "reader" and s.swin == win and valid_win(s.pwin) then
+    if s.swin == win and valid_win(s.pwin) then
       return s
     end
   end
@@ -823,21 +739,10 @@ local function handle(s, line)
     s.doc = { rows = rows, chunk = chunk, base = base }
     fill(s, rows, chunk, base)
     s.view = nil
-    if page_win(s) and (s.kind == "reader" or M.config.follow) then
+    if page_win(s) then
       follow(s, true)
     end
     send_view(s)
-  elseif kind == "at" then
-    local tag, numbers = rest:match("^(%S+) ?(.*)$")
-    local fn = tag and s.waiting[tag]
-    if fn then
-      s.waiting[tag] = nil
-      local values = {}
-      for number in numbers:gmatch("%S+") do
-        values[#values + 1] = tonumber(number)
-      end
-      fn(unpack(values))
-    end
   end
 end
 
@@ -886,58 +791,30 @@ close_session = function(s, leaving)
       pcall(vim.fn.jobstop, job)
     end, 1000)
   end
-  if s.kind == "reader" then
-    hide_page(s)
-  elseif valid_win(s.pwin) and #vim.api.nvim_list_wins() > 1 then
-    pcall(vim.api.nvim_win_close, s.pwin, true)
-  end
+  hide_page(s)
   if vim.api.nvim_buf_is_valid(s.pbuf) then
     pcall(vim.api.nvim_buf_delete, s.pbuf, { force = true })
   end
 end
 
---- Open a window for the preview buffer next to the current one.
-local function open_window(pbuf)
-  local cfg = M.config
-  if cfg.position == "tab" then
-    vim.cmd("tab split")
-  else
-    local split = ({
-      right = "rightbelow vsplit",
-      left = "leftabove vsplit",
-      bottom = "rightbelow split",
-      top = "leftabove split",
-    })[cfg.position] or "rightbelow vsplit"
-    local where, cmd = split:match("(%S+) (%S+)")
-    vim.cmd(("%s %s%s"):format(where, cfg.size and tostring(cfg.size) or "", cmd))
-  end
-  local win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(win, pbuf)
-  page_options(win)
-  vim.wo[win].winfixwidth = cfg.position == "right" or cfg.position == "left"
-  return win
-end
-
 --- A session for `buf` with its page buffer, and nothing running yet.
-local function new_session(buf, kind)
+local function new_session(buf)
   local cfg = M.config
   if vim.fn.executable(cfg.cmd) == 0 then
     notify(("`%s` not found; install termd or set `cmd`"):format(cfg.cmd), vim.log.levels.ERROR)
     return
   end
   if not vim.o.termguicolors then
-    notify("the preview needs 'termguicolors'", vim.log.levels.WARN)
+    notify("the page needs 'termguicolors'", vim.log.levels.WARN)
   end
   local pbuf = vim.api.nvim_create_buf(false, true)
   vim.bo[pbuf].filetype = "termd"
+  vim.bo[pbuf].bufhidden = "hide"
   -- No name: a name is taken for a file by what looks for the current one
   -- (a file tree revealing it would ask to change to its directory).
   local s = {
-    kind = kind,
     buf = buf,
     pbuf = pbuf,
-    tag = 0,
-    waiting = {},
     timers = {},
     scroller = uv.new_timer(),
     group = vim.api.nvim_create_augroup("termd_" .. buf, { clear = true }),
@@ -947,8 +824,8 @@ local function new_session(buf, kind)
   return s
 end
 
---- Start termd for a session and wire up what both kinds of session need.
---- Returns whether termd runs.
+--- Start termd for a session and wire up what it needs. Returns whether
+--- termd runs.
 local function start(s)
   local cfg, buf, pbuf = M.config, s.buf, s.pbuf
   local argv = { cfg.cmd, "--serve" }
@@ -1001,41 +878,53 @@ local function start(s)
     opts.group = s.group
     vim.api.nvim_create_autocmd(events, opts)
   end
-  s.au = au
-  local update = function()
-    send_text(s)
-  end
-  if cfg.live then
-    au({ "TextChanged", "TextChangedI", "TextChangedP" }, { buffer = buf, callback = debounced(s, cfg.debounce, update) })
-  else
-    au("BufWritePost", { buffer = buf, callback = update })
-  end
+  au("CursorMoved", {
+    buffer = buf,
+    callback = function()
+      if s.pwin then
+        follow(s)
+      end
+    end,
+  })
   au("WinScrolled", {
     callback = function()
       -- Which windows scrolled (or changed size), by their ids.
       local scrolled = vim.v.event
       local pwin = page_win(s)
-      if pwin and scrolled[tostring(pwin)] then
+      if not pwin then
+        return
+      end
+      if scrolled[tostring(pwin)] then
         if s.set and vim.fn.line("w0", pwin) - 1 ~= s.set.top then
-          stop_scroll(s) -- scrolled by the user: it stays where they put it
+          stop_scroll(s) -- scrolled by other means: it stays where it was put
         end
         send_view(s)
       end
-      if (s.kind == "split" and cfg.follow) or (s.kind == "reader" and pwin) then
-        local win = source_win(s)
-        if win and scrolled[tostring(win)] then
-          follow(s)
-        end
+      local win = source_win(s)
+      if win and scrolled[tostring(win)] then
+        follow(s)
       end
+    end,
+  })
+  au("WinResized", {
+    callback = function()
+      check_page(s)
     end,
   })
   au({ "WinResized", "VimResized" }, {
     callback = debounced(s, 50, function()
-      if s.kind == "reader" then
-        check_page(s)
-      end
+      check_page(s)
       send_size(s)
     end),
+  })
+  au({ "BufEnter", "WinEnter", "WinClosed" }, {
+    callback = function()
+      vim.schedule(function()
+        if sessions[buf] == s then
+          check_page(s)
+        end
+      end)
+    end,
   })
   au("ColorScheme", {
     callback = function()
@@ -1044,6 +933,37 @@ local function start(s)
         fill(s, s.doc.rows, s.doc.chunk, s.doc.base)
       end
       send_colors(s)
+    end,
+  })
+  -- Changing the text is editing: the source shows. (Not when writing
+  -- formats it: the page shows what was written. Otherwise termd gets the
+  -- text when the page shows again.)
+  au("BufWritePost", {
+    buffer = buf,
+    callback = function()
+      s.written = vim.api.nvim_buf_get_changedtick(buf)
+      if s.pwin then
+        send_text(s)
+      end
+    end,
+  })
+  au("TextChanged", {
+    buffer = buf,
+    callback = function()
+      if s.pwin and vim.api.nvim_buf_get_changedtick(buf) ~= s.written then
+        hide_page(s)
+      end
+    end,
+  })
+  -- So is Insert, Visual or Replace mode, or an operator; the command line
+  -- (`:w`, a search) is not.
+  au("ModeChanged", {
+    pattern = "n:*",
+    callback = function()
+      local mode = vim.v.event.new_mode or ""
+      if s.pwin and not mode:match("^c") and vim.api.nvim_get_current_win() == s.swin then
+        hide_page(s)
+      end
     end,
   })
   au({ "BufWipeout", "BufDelete" }, {
@@ -1068,72 +988,13 @@ local function current_buf(buf)
   return (buf == nil or buf == 0) and vim.api.nvim_get_current_buf() or buf
 end
 
---- The session previewing `buf`, or shown in it.
+--- The session of `buf`, or the one whose page `buf` is.
 local function session_of(buf)
   buf = current_buf(buf)
   for _, s in pairs(sessions) do
     if s.buf == buf or s.pbuf == buf then
       return s
     end
-  end
-end
-
---- Preview `buf` (default: the current buffer) in a window next to it.
-function M.open(buf)
-  local s = session_of(buf)
-  if s and s.kind == "split" then
-    return
-  elseif s then
-    buf = s.buf
-    M.close(buf)
-  end
-  buf = current_buf(buf)
-  s = new_session(buf, "split")
-  if not s then
-    return
-  end
-  local cfg = M.config
-  local pbuf = s.pbuf
-  vim.bo[pbuf].bufhidden = "wipe"
-  s.swin = vim.fn.bufwinid(buf) ~= -1 and vim.fn.bufwinid(buf) or vim.api.nvim_get_current_win()
-  s.pwin = vim.api.nvim_win_call(s.swin, function()
-    return open_window(pbuf)
-  end)
-  if not start(s) then
-    return
-  end
-
-  if cfg.follow then
-    s.au({ "CursorMoved", "CursorMovedI" }, {
-      buffer = buf,
-      callback = function()
-        follow(s)
-      end,
-    })
-  end
-  s.au("WinClosed", {
-    pattern = tostring(s.pwin),
-    callback = function()
-      vim.schedule(function()
-        close_session(s)
-      end)
-    end,
-  })
-
-  local map = function(lhs, fn, desc)
-    vim.keymap.set("n", lhs, fn, { buffer = pbuf, nowait = true, desc = desc })
-  end
-  map("q", function()
-    close_session(s)
-  end, "Close the preview")
-  for _, lhs in ipairs({ "<CR>", "e", "<2-LeftMouse>" }) do
-    map(lhs, function()
-      M.jump(buf)
-    end, "Go to this place in the source")
-  end
-
-  if not cfg.focus and valid_win(s.swin) then
-    vim.api.nvim_set_current_win(s.swin)
   end
 end
 
@@ -1151,117 +1012,38 @@ function M.read(buf)
     return
   end
   vim.b[buf].termd_reader = nil
-  if s and s.kind == "reader" then
+  if s then
     -- termd still runs from reading before.
     if valid_win(s.pwin) and s.swin ~= win then
       hide_page(s)
     end
     show_page(s, win)
     return
-  elseif s then
-    close_session(s)
   end
-  s = new_session(buf, "reader")
+  s = new_session(buf)
   if not s then
     return
   end
-  vim.bo[s.pbuf].bufhidden = "hide"
   show_page(s, win)
   if not s.pwin or not start(s) then
     close_session(s)
-    return
   end
-
-  local au = s.au
-  au("CursorMoved", {
-    buffer = buf,
-    callback = function()
-      if s.pwin then
-        follow(s)
-      end
-    end,
-  })
-  -- Changing the text is editing: the source shows. (Not when writing
-  -- formats it.)
-  au("BufWritePost", {
-    buffer = buf,
-    callback = function()
-      s.written = vim.api.nvim_buf_get_changedtick(buf)
-    end,
-  })
-  au("TextChanged", {
-    buffer = buf,
-    callback = function()
-      if s.pwin and vim.api.nvim_buf_get_changedtick(buf) ~= s.written then
-        hide_page(s)
-      end
-    end,
-  })
-  -- So is Insert, Visual or Replace mode, or an operator; the command line
-  -- (`:w`, a search) is not.
-  au("ModeChanged", {
-    pattern = "n:*",
-    callback = function()
-      local mode = vim.v.event.new_mode or ""
-      if s.pwin and not mode:match("^c") and vim.api.nvim_get_current_win() == s.swin then
-        hide_page(s)
-      end
-    end,
-  })
-  au("WinResized", {
-    callback = function()
-      check_page(s)
-    end,
-  })
-  au({ "BufEnter", "WinEnter", "WinClosed" }, {
-    callback = function()
-      vim.schedule(function()
-        if sessions[buf] == s then
-          check_page(s)
-        end
-      end)
-    end,
-  })
 end
 
 --- Stop reading `buf` (default: the current buffer): the source shows, its
 --- cursor where the page had it. termd keeps running, to read again soon.
 function M.unread(buf)
   local s = session_of(buf)
-  if s and s.kind == "reader" then
+  if s then
     hide_page(s)
   end
 end
 
---- From the preview, move the cursor in the source window to what the
---- preview's cursor is on, at the same height in the window. (A reader's
---- cursor is in the source already.)
-function M.jump(buf)
-  local s = session_of(buf)
-  if not s or s.kind == "reader" or not valid_win(s.pwin) then
-    return
-  end
-  local cursor = vim.api.nvim_win_get_cursor(s.pwin)
-  local cell, winline = 0, 1
-  vim.api.nvim_win_call(s.pwin, function()
-    cell, winline = vim.fn.virtcol(".") - 1, vim.fn.winline()
-  end)
-  local line, byte = spot(s, cursor[1] - 1, cell)
-  local win = source_win(s)
-  if sessions[s.buf] ~= s or not win then
-    return
-  end
-  line = clamp(line, 1, vim.api.nvim_buf_line_count(s.buf))
-  vim.api.nvim_set_current_win(win)
-  vim.fn.winrestview({ topline = topline_for(win, line, winline - 1), lnum = line, col = byte })
-end
-
---- Close the preview of `buf` (default: the current buffer, or the buffer
---- previewed in the current window). A reader stops reading, and termd.
+--- Stop reading `buf` (default: the current buffer), and termd.
 function M.close(buf)
   local s = session_of(buf)
   if s then
-    if s.kind == "reader" and vim.api.nvim_buf_is_valid(s.buf) then
+    if vim.api.nvim_buf_is_valid(s.buf) then
       vim.b[s.buf].termd_reader = false
     end
     close_session(s)
@@ -1274,16 +1056,9 @@ function M.reading(win)
   return reading_in(win) ~= nil
 end
 
+--- Whether termd runs for `buf`, reading or not.
 function M.is_open(buf)
   return session_of(buf) ~= nil
-end
-
-function M.toggle(buf)
-  if M.is_open(buf) then
-    M.close(buf)
-  else
-    M.open(buf)
-  end
 end
 
 --- With `reader` set: read `buf` if it is a Markdown file just opened in the
@@ -1338,10 +1113,8 @@ local function map_read_key(buf)
   local raw = vim.api.nvim_replace_termcodes(key, true, false, true)
   vim.keymap.set("n", key, function()
     local win = vim.api.nvim_get_current_win()
-    local s = session_of(buf)
     if
-      not (s and s.kind == "split")
-      and vim.b[buf].termd_reader ~= false
+      vim.b[buf].termd_reader ~= false
       and vim.bo[buf].buftype == ""
       and vim.api.nvim_win_get_config(win).relative == ""
       and not vim.wo[win].diff

@@ -28,7 +28,7 @@ function M.check()
   if vim.o.termguicolors then
     health.ok("'termguicolors' is on")
   else
-    health.error("'termguicolors' is off", { "The preview tells the terminal which image to show by color: set termguicolors" })
+    health.error("'termguicolors' is off", { "The page tells the terminal which image to show by color: set termguicolors" })
   end
 
   local term, program = vim.env.TERM or "", vim.env.TERM_PROGRAM or ""
@@ -37,11 +37,11 @@ function M.check()
   elseif program == "ghostty" or term == "xterm-ghostty" then
     health.ok("Running in Ghostty")
   elseif program == "WezTerm" then
-    health.error("WezTerm does not support Kitty Unicode placeholders, which the preview is drawn with")
+    health.error("WezTerm does not support Kitty Unicode placeholders, which the page is drawn with")
   elseif vim.env.TMUX then
-    health.warn("Inside tmux: the preview needs `set -g allow-passthrough on` and kitty or Ghostty outside")
+    health.warn("Inside tmux: the page needs `set -g allow-passthrough on` and kitty or Ghostty outside")
   else
-    health.warn(("Unknown terminal (%s): the preview needs Kitty Unicode placeholders (kitty, Ghostty)"):format(term))
+    health.warn(("Unknown terminal (%s): the page needs Kitty Unicode placeholders (kitty, Ghostty)"):format(term))
   end
   if vim.env.SSH_CONNECTION or vim.env.SSH_TTY then
     health.warn("Over SSH images are sent inline; when the screen is busy stray characters can appear (CTRL-L redraws)")

@@ -16,7 +16,6 @@
 //! text BYTES                  followed by that many bytes of Markdown
 //! show FIRST LAST             the rows (0-based) the window shows, or is
 //!                             about to
-//! spot TAG ROW COL            what in the source the cell at ROW, COL shows
 //! quit
 //! ```
 //!
@@ -29,8 +28,6 @@
 //! doc ROWS CHUNK BASE         the page is ROWS rows long; rows from
 //!                             i*CHUNK on are image BASE+i
 //! G BYTES                     escape sequences to write to the terminal
-//! at TAG LINE BYTE            answers `spot`: the source line (from 1; 0
-//!                             for none) and the byte in it (from 0)
 //! ```
 //!
 //! With the map the editor scrolls the page along with the source on its
@@ -41,7 +38,7 @@
 
 use crate::doc::{Doc, Engine, LayoutOpts};
 use crate::theme::{Rgb, Theme};
-use crate::{base_dir, kitty};
+use crate::{base_dir, body_px, kitty};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -70,7 +67,6 @@ enum Cmd {
     Colors(Option<Rgb>, Option<Rgb>),
     Text(String),
     Show(u32, u32),
-    Spot { tag: String, row: u32, col: u32 },
     Quit,
 }
 
@@ -78,7 +74,6 @@ enum Cmd {
 fn parse(line: &str) -> Option<Cmd> {
     let mut words = line.split_whitespace();
     let name = words.next()?;
-    let tag = if name == "spot" { words.next()?.to_string() } else { String::new() };
     let mut num = || words.next()?.parse::<u32>().ok();
     let cmd = match name {
         "size" => Cmd::Size { cols: num()?.max(1), cell_w: num()?.max(1), cell_h: num()?.max(1) },
@@ -90,7 +85,6 @@ fn parse(line: &str) -> Option<Cmd> {
             let mut rest = line.split_whitespace().skip(1);
             Cmd::Colors(color(rest.next()?), color(rest.next()?))
         }
-        "spot" => Cmd::Spot { tag, row: num()?, col: num()? },
         "quit" => Cmd::Quit,
         _ => return None,
     };
@@ -258,7 +252,6 @@ impl Server {
             };
             // Take everything that has arrived: a burst of typing is laid
             // out once.
-            let mut queries = Vec::new();
             for cmd in first.into_iter().chain(rx.try_iter()) {
                 match cmd {
                     Cmd::Quit => return Ok(()),
@@ -279,14 +272,10 @@ impl Server {
                         }
                     }
                     Cmd::Show(first, last) => self.view = (first, last),
-                    query => queries.push(query),
                 }
             }
             if self.stale && self.size.is_some() && self.source.is_some() {
                 self.layout()?;
-            }
-            for query in queries {
-                self.answer(query)?;
             }
             self.color_code();
             self.render_view()?;
@@ -298,7 +287,7 @@ impl Server {
         self.stale = false;
         let opts = LayoutOpts {
             page_w: size.cols * size.cell_w,
-            font_px: (size.cell_h as f32 * self.zoom).max(6.0),
+            font_px: body_px(size.cell_h, self.zoom),
             base_dir: base_dir(&self.path),
             theme: Theme::new(self.colors.0, self.colors.1, self.force_dark),
             scroll_tables: false,
@@ -325,18 +314,6 @@ impl Server {
         self.reply(&format!("doc {rows} {chunk_rows} {}", self.base))?;
         self.page = Some(page);
         Ok(())
-    }
-
-    fn answer(&mut self, query: Cmd) -> Result<()> {
-        let Cmd::Spot { tag, row, col } = query else { return Ok(()) };
-        // The middle of the cell. Without a page there is no place to name,
-        // but whoever asked is waiting for an answer.
-        let spot = self.page.as_ref().and_then(|page| {
-            let Size { cell_w, cell_h, .. } = page.size;
-            page.doc.source_at((col as f32 + 0.5) * cell_w as f32, (row as f32 + 0.5) * cell_h as f32)
-        });
-        let (line, byte) = spot.unwrap_or((0, 0));
-        self.reply(&format!("at {tag} {line} {byte}"))
     }
 
     /// Color code blocks for a moment; chunks with one that changed have
@@ -453,8 +430,7 @@ mod tests {
         assert_eq!(parse("size 80 10 21\n"), Some(Cmd::Size { cols: 80, cell_w: 10, cell_h: 21 }));
         assert_eq!(parse("show 40 12"), Some(Cmd::Show(12, 40)));
         assert_eq!(parse("colors #1e1e2e -"), Some(Cmd::Colors(Some(Rgb(0x1e, 0x1e, 0x2e)), None)));
-        assert_eq!(parse("spot a 3 14"), Some(Cmd::Spot { tag: "a".into(), row: 3, col: 14 }));
-        assert_eq!(parse("spot a 3"), None);
+        assert_eq!(parse("spot a 3 14"), None);
         assert_eq!(parse("quit"), Some(Cmd::Quit));
         assert_eq!(parse("size 80"), None);
         assert_eq!(parse("dance"), None);

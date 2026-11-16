@@ -915,18 +915,6 @@ impl Doc {
             .collect()
     }
 
-    /// Where in the source the text at (or nearest to) the point (`x`, `y`)
-    /// of the page comes from: the 1-based line, and the byte in it.
-    pub fn source_at(&self, x: f32, y: f32) -> Option<(u32, u32)> {
-        let hit = self.hit(x, y)?;
-        let Kind::Text { content: Some(content), .. } = &self.lay.items.get(hit.item as usize)?.kind else {
-            return None;
-        };
-        let src = content.map.to_source(hit.character);
-        let line = self.lines.line_of(src);
-        Some((line, src - self.lines.start_of(line)))
-    }
-
     /// The tables laid out so far.
     pub fn tables(&self) -> &[TableBox] {
         &self.lay.tables
@@ -2553,18 +2541,6 @@ Last &amp; final paragraph.
             let tops = doc.line_offsets();
             assert!(tops.windows(2).all(|w| w[0] <= w[1]), "{width}: {tops:?}");
             assert!(tops[4] > tops[1] && tops[6] > tops[4], "{width}: {tops:?}");
-        }
-    }
-
-    #[test]
-    fn points_map_to_places_in_the_source() {
-        let Some(mut eng) = engine() else { return };
-        let doc = layout(&mut eng, SAMPLE, 900);
-        let lines: Vec<&str> = SAMPLE.lines().collect();
-        for needle in ["Title", "second", "a link", "two", "quoted", "b = 2", "omega", "final"] {
-            let (x, y) = find(&doc, needle);
-            let (line, byte) = doc.source_at(x, y).expect("there is text");
-            assert!(lines[line as usize - 1][byte as usize..].starts_with(needle), "{needle:?} at {line}:{byte}");
         }
     }
 

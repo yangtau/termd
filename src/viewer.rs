@@ -4,7 +4,7 @@
 use crate::doc::{Doc, Engine, LayoutOpts, Pos, TableBox};
 use crate::theme::Theme;
 use crate::term::Probe;
-use crate::{Cli, Trace, base_dir, kitty, modified, open, read_source};
+use crate::{Cli, Trace, base_dir, body_px, kitty, modified, open, read_source};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::{cursor, execute, terminal};
@@ -128,13 +128,9 @@ impl Geometry {
         (self.rows - 1) * self.cell_h
     }
 
-    /// Body font size: the height of a terminal line, which is about a
-    /// fifth more than the terminal's own font size. A page of running text
-    /// in a proportional face, a serif above all, wants to be larger than
-    /// the monospace text around it to read as well. This also tracks
-    /// HiDPI scaling.
+    /// Body font size: about the terminal's own (see `body_px`).
     fn font_px(&self, zoom: f32) -> f32 {
-        (self.cell_h as f32 * zoom).max(6.0)
+        body_px(self.cell_h, zoom)
     }
 }
 
