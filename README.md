@@ -102,7 +102,8 @@ environment.systemPackages = [ inputs.termd.packages.${pkgs.system}.default ];
   `read_key` 可以换成别的键，设为 `false` 则只用 `:TermdRead`；
 - 自动进入只在文件第一次显示时发生：退出阅读后切走再切回来，仍然是源码；
 - Neovim 不支持自定义模式，状态栏的模式仍显示 NORMAL；状态栏可以用 `require("termd").reading()`
-  判断当前窗口是否在阅读。阅读时终端光标在 Normal 模式下隐藏，标记的颜色是 `TermdCursor` 高亮组。
+  判断当前窗口是否在阅读。阅读时终端光标隐藏（Neovim 0.12 把浮动窗口下面的光标画成 Replace 模式的形状，所以 `guicursor` 的 `n` 和 `r` 都要隐藏）；
+  页面左边的竖条标出光标所在的行，从它在页面上开始的地方到后面一行开始的地方，颜色是 `TermdCursor` 高亮组。
 
 滚动：页面跟随的是源码窗口，而不只是光标所在的行。源码窗口里显示的那些行对应页面上的一段，
 这一段通常比窗口高；光标在源码窗口第一行时页面和源码的开头对齐，在最后一行时结尾对齐，

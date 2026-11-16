@@ -95,7 +95,8 @@ Normal mode: <Esc> in Normal mode reads (so <Esc> twice from Insert mode),
 and |:TermdRead| does too. The page then lies over the source's window,
 which keeps the buffer and the focus: move the cursor and scroll as in the
 source (j, CTRL-D, gg, /, n, the mouse wheel) and the page follows
-(|termd-scrolling|); a mark at its left edge is the row the cursor is on.
+(|termd-scrolling|); a bar at its left edge marks the cursor's line, from
+where it starts on the page to where a later line does.
 <Esc> does nothing more, so pressing it once too often stays put. The source shows again, its cursor where it was,
 with:
 
@@ -123,8 +124,9 @@ it shows: a file left for its source stays so when you come back to it. Set
 Neovim has no way to add a mode of its own, so the mode indicator still
 says NORMAL. A status line can show reading with
 `require("termd").reading()`, true for a window the page lies over. The
-terminal's cursor is hidden there in Normal mode (|guicursor|, with a
-highlight of `blend` 100); `TermdCursor` colors the mark.
+terminal's cursor is hidden there (|guicursor| `n` and `r`, with a
+highlight of `blend` 100: Neovim 0.12 gives a cursor behind a floating
+window the shape of Replace mode); `TermdCursor` colors the bar.
 
 ==============================================================================
 HOW IT WORKS                                                       *termd-how*

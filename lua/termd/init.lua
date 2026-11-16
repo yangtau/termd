@@ -344,16 +344,59 @@ end
 
 local mark_ns = vim.api.nvim_create_namespace("termd_mark")
 
---- Mark row `row` of the page as the one the cursor is on.
-local function mark(s, row)
-  if not vim.api.nvim_buf_is_valid(s.pbuf) then
+--- The rows (0-based, with fractions) that source line `lnum` takes on
+--- the page: from its top to the next line's, or further when the next
+--- lines start on the same row of the page (lines of one paragraph that
+--- the page puts together).
+local function span_of(s, lnum)
+  local map = s.map
+  local lines = #map - 1
+  lnum = clamp(lnum, 1, lines)
+  local top, bottom = map[lnum], map[lines + 1]
+  for i = lnum + 1, lines + 1 do
+    if map[i] > top then
+      bottom = map[i]
+      break
+    end
+  end
+  return top, bottom
+end
+
+--- Glyphs for the left half of a cell, by the halves of the cell that are
+--- covered: the upper (1), the lower (2) or both (3).
+local MARK_GLYPHS = { [1] = "▘", [2] = "▖", [3] = "▌" }
+
+--- Mark the rows of the page that source line `lnum` takes, at its left
+--- edge, to the half of a row.
+local function mark(s, lnum)
+  if not (s.map and #s.map > 1 and vim.api.nvim_buf_is_valid(s.pbuf)) then
     return
   end
-  s.mark = vim.api.nvim_buf_set_extmark(s.pbuf, mark_ns, row, 0, {
-    id = s.mark,
-    virt_text = { { "▌", "TermdCursor" } },
-    virt_text_pos = "overlay",
-  })
+  s.mark_lnum = lnum
+  local top, bottom = span_of(s, lnum)
+  local rows = vim.api.nvim_buf_line_count(s.pbuf)
+  -- In halves of a row, and a row at least, to be seen.
+  local from, to = math.floor(2 * top + 0.5), math.floor(2 * bottom + 0.5)
+  if to - from < 2 then
+    from = math.floor(top + bottom - 1 + 0.5)
+    to = from + 2
+  end
+  from, to = clamp(from, 0, 2 * rows - 2), clamp(to, 2, 2 * rows)
+  local key = from .. ":" .. to
+  if key == s.mark_key then
+    return
+  end
+  s.mark_key = key
+  vim.api.nvim_buf_clear_namespace(s.pbuf, mark_ns, 0, -1)
+  for row = math.floor(from / 2), math.ceil(to / 2) - 1 do
+    local halves = (2 * row >= from and 1 or 0) + (2 * row + 2 <= to and 2 or 0)
+    if MARK_GLYPHS[halves] then
+      vim.api.nvim_buf_set_extmark(s.pbuf, mark_ns, row, 0, {
+        virt_text = { { MARK_GLYPHS[halves], "TermdCursor" } },
+        virt_text_pos = "overlay",
+      })
+    end
+  end
 end
 
 --- Show the page from row `top` (0-based) in `win`, with the cursor on row
@@ -368,7 +411,6 @@ local function set_view(s, win, top, row, col)
   vim.api.nvim_win_call(win, function()
     vim.fn.winrestview({ topline = top + 1, lnum = lnum, col = col or 0, leftcol = 0 })
   end)
-  mark(s, lnum - 1)
   send_view(s)
 end
 
@@ -510,6 +552,7 @@ local function follow(s, jump)
   local row = row_of(s, v.lnum + v.along)
   local margin = math.min(2, math.floor((height - 1) / 2))
   top = math.max(row - (height - 1 - margin), math.min(top, row - margin))
+  mark(s, v.lnum)
   scroll_to(s, top, row, jump)
 end
 
@@ -554,6 +597,11 @@ local function fill(s, rows, chunk, base)
   end
   s.filled = { rows = rows, chunk = chunk, base = base, cols = cols, chunks = chunks }
   s.chunks = math.max(s.chunks or 0, chunks)
+  -- (The lines the mark was on may have been replaced.)
+  s.mark_key = nil
+  if s.mark_lnum then
+    mark(s, s.mark_lnum)
+  end
 end
 
 -- Reading ---------------------------------------------------------------
@@ -570,13 +618,15 @@ end
 
 -- The terminal's cursor is in the source window, under the page: hidden
 -- there while it is read (with a highlight that blends it away entirely).
+-- Neovim 0.12 gives a cursor behind a floating window that has not the
+-- focus the shape of Replace mode, `r` in 'guicursor'; before, Normal
+-- mode's, `n`. (Replace mode itself ends reading.)
 local saved_guicursor
 
 local function hide_cursor(hide)
   if hide and not saved_guicursor then
     saved_guicursor = vim.o.guicursor
-    vim.api.nvim_set_hl(0, "TermdHiddenCursor", { blend = 100, nocombine = true })
-    vim.o.guicursor = (saved_guicursor ~= "" and saved_guicursor .. "," or "") .. "n:TermdHiddenCursor"
+    vim.o.guicursor = (saved_guicursor ~= "" and saved_guicursor .. "," or "") .. "n-r:TermdHiddenCursor"
   elseif not hide and saved_guicursor then
     vim.o.guicursor = saved_guicursor
     saved_guicursor = nil
@@ -1129,6 +1179,7 @@ end
 
 local function define_highlights()
   vim.api.nvim_set_hl(0, "TermdCursor", { default = true, link = "Title" })
+  vim.api.nvim_set_hl(0, "TermdHiddenCursor", { blend = 100, nocombine = true })
 end
 
 function M.setup(opts)
