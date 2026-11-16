@@ -95,8 +95,13 @@ Normal mode: <Esc> in Normal mode reads (so <Esc> twice from Insert mode),
 and |:TermdRead| does too. The page then lies over the source's window,
 which keeps the buffer and the focus: move the cursor and scroll as in the
 source (j, CTRL-D, gg, /, n, the mouse wheel) and the page follows
-(|termd-scrolling|); a bar at its left edge marks the cursor's line, from
-where it starts on the page to where a later line does.
+(|termd-scrolling|). The page shows the cursor on the character it is on;
+on markup that the page does not show (`**`, a link's address, `# `) as a
+caret by the nearest text of its line, and on an empty line as a caret
+between the blocks around it. With 'hlsearch' the matches of the last
+search are lit up on the page too, the one at the cursor more than the
+others, until |:nohlsearch|. (With a termd older than the plugin a bar at
+the left edge marks the cursor's line instead.)
 <Esc> does nothing more, so pressing it once too often stays put. The source shows again, its cursor where it was,
 with:
 
@@ -126,7 +131,14 @@ says NORMAL. A status line can show reading with
 `require("termd").reading()`, true for a window the page lies over. The
 terminal's cursor is hidden there (|guicursor| `n` and `r`, with a
 highlight of `blend` 100: Neovim 0.12 gives a cursor behind a floating
-window the shape of Replace mode); `TermdCursor` colors the bar.
+window the shape of Replace mode).
+
+The colors come from highlight groups, their background or else their
+text color, mixed with the background:
+
+    TermdCursor     the cursor (links to Title)
+    TermdSearch     search matches (links to Search)
+    TermdCurSearch  the match at the cursor (links to CurSearch)
 
 ==============================================================================
 HOW IT WORKS                                                       *termd-how*

@@ -116,6 +116,22 @@ impl TextMap {
         }
     }
 
+    /// The offset in the text nearest to source offset `src` among the
+    /// stretches that come from source range `within` (a line), with how
+    /// far `src` is from it: the character `src` is on, or else the one
+    /// after it or the end of the one before it. None if no stretch does.
+    pub fn nearest(&self, src: u32, within: Range<u32>) -> Option<(u32, u32)> {
+        self.stretches
+            .iter()
+            .filter(|(_, range)| range.start < range.end && range.start < within.end && range.end > within.start)
+            .map(|(start, range)| match src {
+                _ if src < range.start => (range.start - src, *start),
+                _ if src >= range.end => (src + 1 - range.end, start + (range.end - range.start)),
+                _ => (0, start + (src - range.start)),
+            })
+            .min_by_key(|&(distance, _)| distance)
+    }
+
     /// Offset in the text of the character at source offset `src`; for a
     /// position between stretches (markup), the start of the next one.
     pub fn to_text(&self, src: u32) -> u32 {

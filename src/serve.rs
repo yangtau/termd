@@ -16,12 +16,20 @@
 //! text BYTES                  followed by that many bytes of Markdown
 //! show FIRST LAST             the rows (0-based) the window shows, or is
 //!                             about to
+//! cursor COLOR FROM TO        the editor's cursor is on source bytes FROM..TO
+//!                             (empty at the end of a line); `cursor` alone:
+//!                             none
+//! marks [COLOR FROM TO]...    source bytes to light up (search matches)
 //! quit
 //! ```
 //!
-//! and replies go to stdout, one per line:
+//! A COLOR is `#rrggbbaa`: the page there stands on that color at strength
+//! `aa` over the background, under its text, like a selection.
+//!
+//! Replies go to stdout, one per line:
 //!
 //! ```text
+//! can marks                   first: this termd takes `cursor` and `marks`
 //! map CELL_H Y1 Y2 ... END    for a page about to be announced: the pixel
 //!                             offset of the top of each source line, then
 //!                             the page's height; a row is CELL_H pixels
@@ -67,7 +75,31 @@ enum Cmd {
     Colors(Option<Rgb>, Option<Rgb>),
     Text(String),
     Show(u32, u32),
+    Cursor(Option<Mark>),
+    Marks(Vec<Mark>),
     Quit,
+}
+
+/// Source bytes the page lights up, on `color` at `strength`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Mark {
+    color: Rgb,
+    strength: f32,
+    from: u32,
+    to: u32,
+}
+
+/// `COLOR FROM TO`, with the color as `#rrggbbaa`.
+fn mark(color: &str, from: &str, to: &str) -> Option<Mark> {
+    let hex = color.strip_prefix('#').filter(|h| h.len() == 8)?;
+    let v = u32::from_str_radix(hex, 16).ok()?;
+    let (from, to) = (from.parse::<u32>().ok()?, to.parse::<u32>().ok()?);
+    Some(Mark {
+        color: Rgb((v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8),
+        strength: (v & 0xff) as f32 / 255.0,
+        from: from.min(to),
+        to: from.max(to),
+    })
 }
 
 /// One command line, except `text`, whose body follows it.
@@ -84,6 +116,19 @@ fn parse(line: &str) -> Option<Cmd> {
         "colors" => {
             let mut rest = line.split_whitespace().skip(1);
             Cmd::Colors(color(rest.next()?), color(rest.next()?))
+        }
+        "cursor" => {
+            let rest: Vec<&str> = words.collect();
+            match rest[..] {
+                [] => Cmd::Cursor(None),
+                [color, from, to] => Cmd::Cursor(Some(mark(color, from, to)?)),
+                _ => return None,
+            }
+        }
+        "marks" => {
+            let rest: Vec<&str> = words.collect();
+            let marks: Option<Vec<Mark>> = rest.chunks(3).map(|m| mark(m.first()?, m.get(1)?, m.get(2)?)).collect();
+            Cmd::Marks(marks?)
         }
         "quit" => Cmd::Quit,
         _ => return None,
@@ -190,6 +235,10 @@ struct Server {
     /// and those of them that show the current page.
     uploaded: BTreeMap<u32, u64>,
     current: BTreeSet<u32>,
+    cursor: Option<Mark>,
+    marks: Vec<Mark>,
+    /// Where the page shows them: rectangles on their ground colors.
+    lit: Vec<(Rgb, [f32; 4])>,
     uploader: kitty::Uploader,
     tmux: bool,
     base: u32,
@@ -212,6 +261,9 @@ pub fn run(path: &Path, engine: Engine, zoom: f32, force_dark: Option<bool>) -> 
         view: (0, 0),
         uploaded: BTreeMap::new(),
         current: BTreeSet::new(),
+        cursor: None,
+        marks: Vec::new(),
+        lit: Vec::new(),
         uploader: uploader(),
         tmux: std::env::var_os("TMUX").is_some(),
         base: (std::process::id() % 4000 + 1) * IDS,
@@ -242,6 +294,7 @@ fn uploader() -> kitty::Uploader {
 
 impl Server {
     fn serve(&mut self, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
+        self.reply("can marks")?;
         loop {
             let coloring = self.page.as_ref().is_some_and(|p| p.doc.awaits_highlight());
             let wait = if coloring { Duration::from_millis(4) } else { Duration::from_secs(3600) };
@@ -272,11 +325,14 @@ impl Server {
                         }
                     }
                     Cmd::Show(first, last) => self.view = (first, last),
+                    Cmd::Cursor(cursor) => self.cursor = cursor,
+                    Cmd::Marks(marks) => self.marks = marks,
                 }
             }
             if self.stale && self.size.is_some() && self.source.is_some() {
                 self.layout()?;
             }
+            self.light_up();
             self.color_code();
             self.render_view()?;
         }
@@ -314,6 +370,33 @@ impl Server {
         self.reply(&format!("doc {rows} {chunk_rows} {}", self.base))?;
         self.page = Some(page);
         Ok(())
+    }
+
+    /// Find the cursor and the marks on the page; the chunks where they
+    /// were or are now have to be rendered again.
+    fn light_up(&mut self) {
+        let Some(page) = &self.page else { return };
+        let paper = page.doc.paper();
+        let mut lit = Vec::new();
+        for mark in &self.marks {
+            let ground = paper.mix(mark.color, mark.strength);
+            lit.extend(page.doc.source_rects(mark.from, mark.to).into_iter().map(|rect| (ground, rect)));
+        }
+        // Over the marks.
+        if let Some(cursor) = &self.cursor {
+            let ground = paper.mix(cursor.color, cursor.strength);
+            lit.extend(page.doc.cursor_rects(cursor.from, cursor.to).into_iter().map(|rect| (ground, rect)));
+        }
+        if lit == self.lit {
+            return;
+        }
+        for (_, [_, y, _, h]) in self.lit.iter().chain(&lit) {
+            let (top, bottom) = (y.max(0.0) as u32, (y + h).max(1.0) as u32);
+            for chunk in page.chunk_of_y(top)..=page.chunk_of_y(bottom.saturating_sub(1).max(top)) {
+                self.current.remove(&chunk);
+            }
+        }
+        self.lit = lit;
     }
 
     /// Color code blocks for a moment; chunks with one that changed have
@@ -363,7 +446,22 @@ impl Server {
         let first = chunk * page.chunk_rows;
         let rows = page.chunk_rows.min(page.rows - first);
         let (w, h) = (cols * cell_w, rows * cell_h);
-        let rgba = page.doc.render(&mut self.engine, 0, 0, first * cell_h, w, h, false);
+        let mut rgba = page.doc.render(&mut self.engine, 0, 0, first * cell_h, w, h, false);
+        // What is lit up: those rectangles rendered on their colors.
+        let top = first * cell_h;
+        for &(ground, [x, y, rw, rh]) in &self.lit {
+            let (x0, x1) = (x.floor().max(0.0) as u32, ((x + rw).ceil().max(0.0) as u32).min(w));
+            let (y0, y1) = ((y.floor().max(0.0) as u32).max(top), ((y + rh).ceil().max(0.0) as u32).min(top + h));
+            if x0 >= x1 || y0 >= y1 {
+                continue;
+            }
+            let crop = page.doc.render_on(&mut self.engine, 0, x0, y0, x1 - x0, y1 - y0, Some(ground));
+            let row = ((x1 - x0) * 4) as usize;
+            for (i, line) in crop.chunks_exact(row).enumerate() {
+                let at = (((y0 - top) as usize + i) * w as usize + x0 as usize) * 4;
+                rgba[at..at + row].copy_from_slice(line);
+            }
+        }
         self.current.insert(chunk);
         // Most of a page stays as it was when its text changes in one
         // place; the terminal already has those pixels.
@@ -432,6 +530,13 @@ mod tests {
         assert_eq!(parse("colors #1e1e2e -"), Some(Cmd::Colors(Some(Rgb(0x1e, 0x1e, 0x2e)), None)));
         assert_eq!(parse("spot a 3 14"), None);
         assert_eq!(parse("quit"), Some(Cmd::Quit));
+        let mark = Mark { color: Rgb(0xff, 0x80, 0), strength: 0x66 as f32 / 255.0, from: 3, to: 9 };
+        assert_eq!(parse("cursor #ff800066 3 9"), Some(Cmd::Cursor(Some(mark))));
+        assert_eq!(parse("cursor"), Some(Cmd::Cursor(None)));
+        assert_eq!(parse("marks #ff800066 3 9 #ff800066 9 3"), Some(Cmd::Marks(vec![mark; 2])));
+        assert_eq!(parse("marks"), Some(Cmd::Marks(vec![])));
+        assert_eq!(parse("marks #ff8000 3 9"), None);
+        assert_eq!(parse("marks #ff800066 3"), None);
         assert_eq!(parse("size 80"), None);
         assert_eq!(parse("dance"), None);
         assert_eq!(parse(""), None);

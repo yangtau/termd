@@ -596,6 +596,36 @@ fn lit_extent(glyphs: &[LayoutGlyph], i: usize, pad: f32) -> (f32, f32) {
     }
 }
 
+/// The part of `source[range]` that is `text`, if it is there as it is
+/// (the code of an inline code span, inside its backticks); else all of it.
+fn inner(source: &str, range: Range<u32>, text: &str) -> Range<u32> {
+    let found = source.get(range.start as usize..range.end as usize).and_then(|s| s.find(text));
+    match found {
+        Some(i) if !text.is_empty() => {
+            let start = range.start + i as u32;
+            start..start + text.len() as u32
+        }
+        _ => range,
+    }
+}
+
+/// Where a caret before the character at `offset` in a text goes: its x in
+/// the text, and the top and height of its line.
+fn caret_in(buf: &Buffer, content: &Content, offset: u32) -> (f32, f32, f32) {
+    let line = content.line_starts.partition_point(|&start| start <= offset).saturating_sub(1);
+    let in_line = offset - content.line_starts.get(line).copied().unwrap_or(0).min(offset);
+    let mut last = None;
+    for run in buf.layout_runs().filter(|run| run.line_i == line) {
+        let dx = indent(buf, &run);
+        if let Some(g) = run.glyphs.iter().find(|g| g.end as u32 > in_line) {
+            return (dx + g.x, run.line_top, run.line_height);
+        }
+        let end = run.glyphs.last().map_or(dx, |g| dx + g.x + g.w);
+        last = Some((end, run.line_top, run.line_height));
+    }
+    last.unwrap_or((0.0, 0.0, buf.metrics().line_height))
+}
+
 /// The text of a code block as it is displayed and highlighted.
 fn code_text(raw: &str) -> &str {
     raw.strip_suffix('\n').unwrap_or(raw)
@@ -1053,6 +1083,73 @@ impl Doc {
         rects
     }
 
+    /// The highlight for the text that comes from source bytes `from..to`,
+    /// as rectangles on the page (not on sideways scrolling tables).
+    pub fn source_rects(&self, from: u32, to: u32) -> Vec<[f32; 4]> {
+        let mut rects = Vec::new();
+        for (index, _, _, _, content) in self.texts() {
+            let range = content.map.range();
+            if range.start >= to || range.end <= from {
+                continue;
+            }
+            let (start, end) = (content.map.to_text(from), content.map.to_text(to));
+            if start < end {
+                let item = index as u32;
+                let (a, b) = (Pos { item, offset: start }, Pos { item, offset: end });
+                let lit = self.selection_rects(a, b, f32::MIN, f32::MAX);
+                rects.extend(lit.into_iter().filter(|(layer, _)| *layer == 0).map(|(_, rect)| rect));
+            }
+        }
+        rects
+    }
+
+    /// Where an editor's cursor on source bytes `from..to` (a character,
+    /// or nothing at the end of a line) shows: on the character if that
+    /// shows; else as a caret by the nearest text of its line (the cursor
+    /// is on markup, like `**` or a link's address); else as a caret at the
+    /// left of the room its line takes (an empty line, a fence), in line
+    /// with the text after it.
+    pub fn cursor_rects(&self, from: u32, to: u32) -> Vec<[f32; 4]> {
+        if to > from {
+            let rects = self.source_rects(from, to);
+            if !rects.is_empty() {
+                return rects;
+            }
+        }
+        let em = self.lay.em;
+        let caret_w = (0.12 * em).round().max(2.0);
+        let line = self.lines.line_of(from);
+        let within = self.lines.start_of(line)..self.lines.start_of(line + 1);
+        let nearest = self
+            .texts()
+            .filter(|(_, item, ..)| item.layer == 0)
+            .filter_map(|(_, item, x, buf, content)| {
+                let (distance, offset) = content.map.nearest(from, within.clone())?;
+                Some((distance, item, x, buf, content, offset))
+            })
+            .min_by_key(|&(distance, ..)| distance);
+        if let Some((_, item, x, buf, content, offset)) = nearest {
+            let (at, top, height) = caret_in(buf, content, offset);
+            return vec![[x + at - caret_w / 2.0, item.y + top, caret_w, height]];
+        }
+        let tops = self.line_offsets();
+        let i = (line as usize).clamp(1, tops.len().saturating_sub(1).max(1));
+        let (Some(&top), Some(&bottom)) = (tops.get(i - 1), tops.get(i)) else { return Vec::new() };
+        let middle = (top + bottom) as f32 / 2.0;
+        let height = (1.2 * em).min((bottom - top) as f32).max(em * 0.6);
+        // At the left edge of the text that follows.
+        let after = |(_, item, .., content): &(usize, &Item, f32, &Buffer, &Content)| {
+            item.layer == 0 && content.map.range().start >= within.start
+        };
+        let x = self.texts().find(after).map_or(self.origin_x as f32, |(_, _, x, ..)| x);
+        vec![[x - caret_w / 2.0, middle - height / 2.0, caret_w, height]]
+    }
+
+    /// The color the page is seen against (a guess when it is not known).
+    pub fn paper(&self) -> Rgb {
+        self.lay.theme.paper
+    }
+
     /// The text between `from` and `to` as plain text: blocks separated by
     /// empty lines, list items with their markers, table cells by tabs.
     pub fn selected_text(&self, from: Pos, to: Pos) -> String {
@@ -1413,7 +1510,11 @@ impl Layout {
                     (false, true) => Some(self.theme.dim),
                     _ => None,
                 },
-                src: self.at.clone(),
+                // Inline code comes from inside its backticks.
+                src: match code {
+                    true => inner(&self.source, self.at.clone(), t),
+                    false => self.at.clone(),
+                },
             });
         }
     }
@@ -2122,10 +2223,27 @@ impl Doc {
         height: u32,
         lit: bool,
     ) -> Vec<u8> {
+        let ground = if lit { Some(self.lay.theme.select) } else { None };
+        self.render_on(eng, layer, x0, y0, width, height, ground)
+    }
+
+    /// `render` on an opaque `ground` color (the page's own, if any, when
+    /// `None`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_on(
+        &self,
+        eng: &mut Engine,
+        layer: u16,
+        x0: u32,
+        y0: u32,
+        width: u32,
+        height: u32,
+        ground: Option<Rgb>,
+    ) -> Vec<u8> {
         let (w, h) = (width.max(1), height.max(1));
         let mut pm = Pixmap::new(w, h).expect("non-zero pixmap size");
         let theme = &self.lay.theme;
-        let ground = if lit { Some(theme.select) } else { theme.page };
+        let ground = ground.or(theme.page);
         if let Some(bg) = ground {
             pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, 255));
         }
@@ -2433,6 +2551,64 @@ Last &amp; final paragraph.
         for (needle, line) in expect {
             assert_eq!(line_at(&doc, needle), line, "line of {needle:?}");
         }
+    }
+
+    /// Whether the point is inside the rectangle.
+    fn within([x, y, w, h]: [f32; 4], (px, py): (f32, f32)) -> bool {
+        px >= x && px <= x + w && py >= y && py <= y + h
+    }
+
+    #[test]
+    fn lights_up_source_ranges() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, SAMPLE, 900);
+        let src = SAMPLE.find("second line").unwrap() as u32;
+        let rects = doc.source_rects(src, src + 6);
+        assert_eq!(rects.len(), 1);
+        assert!(within(rects[0], find(&doc, "second")));
+        assert!(!within(rects[0], find(&doc, "line with")));
+        // Markup shows nothing: of `**two**` only the word.
+        let src = SAMPLE.find("**two**").unwrap() as u32;
+        let rects = doc.source_rects(src, src + 7);
+        assert_eq!(rects.len(), 1);
+        assert!(within(rects[0], find(&doc, "two")));
+        assert!(doc.source_rects(src, src + 2).is_empty());
+        // Inline code: its code, without the backticks.
+        let text = "Run `nix build` now.\n";
+        let doc = layout(&mut eng, text, 900);
+        let rects = doc.source_rects(5, 8);
+        assert_eq!(rects.len(), 1);
+        let ([x, _, w, _], (n, _), (b, _)) = (rects[0], find(&doc, "nix"), find(&doc, "build"));
+        assert!(x < n && x + w < b, "{:?} n at {n}, b at {b}", rects[0]);
+    }
+
+    #[test]
+    fn puts_the_cursor_where_its_line_shows() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, SAMPLE, 900);
+        // On a character: the character.
+        let src = SAMPLE.find("item one").unwrap() as u32;
+        let on = doc.cursor_rects(src, src + 1);
+        assert_eq!(on.len(), 1);
+        assert!(within(on[0], find(&doc, "item one")));
+        // On markup: a caret before the text it is next to, on its line.
+        let src = SAMPLE.find("**two**").unwrap() as u32;
+        let caret = doc.cursor_rects(src, src + 1);
+        let (x, y) = find(&doc, "two");
+        assert_eq!(caret.len(), 1);
+        assert!(caret[0][2] < on[0][2] && (caret[0][0] - x).abs() < 10.0);
+        assert!(caret[0][1] <= y && y <= caret[0][1] + caret[0][3]);
+        // On the `# ` of a heading: by the heading.
+        let caret = doc.cursor_rects(0, 1);
+        assert!(within(caret[0], (caret[0][0] + 0.5, find(&doc, "Title").1)));
+        // On an empty line: between the blocks around it, in line with the
+        // text after it.
+        let src = SAMPLE.find("\n\n- item").unwrap() as u32 + 1;
+        let caret = doc.cursor_rects(src, src);
+        let (above, below) = (find(&doc, "in it").1, find(&doc, "item one").1);
+        assert_eq!(caret.len(), 1);
+        assert!(caret[0][1] > above && caret[0][1] + caret[0][3] < below, "{caret:?} {above} {below}");
+        assert!((caret[0][0] - find(&doc, "item one").0).abs() < 40.0, "{caret:?}");
     }
 
     #[test]

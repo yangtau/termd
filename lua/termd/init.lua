@@ -313,6 +313,99 @@ end
 
 M._row_of = row_of
 
+--- The source line (1-based) at row `row` of the page: the last that
+--- starts at or above it.
+local function line_at(s, row)
+  local map = s.map
+  local low, high = 1, #map - 1
+  while low < high do
+    local mid = math.ceil((low + high) / 2)
+    if map[mid] <= row then
+      low = mid
+    else
+      high = mid - 1
+    end
+  end
+  return math.max(1, low)
+end
+
+-- The cursor and search matches on the page -----------------------------
+--
+-- termd lights up source bytes on the page, under the text they show as:
+-- the character the cursor is on (or a caret where nothing of it shows)
+-- and, with 'hlsearch', the matches of the last search in what the page
+-- shows. (A termd from before says nothing of it; then a bar at the left
+-- edge marks the cursor's line, see `mark`.)
+
+--- `#rrggbbaa`: the color of highlight group `name` (its background, or
+--- else its text color, or else `fallback`) at `strength`.
+local function mark_color(name, fallback, strength)
+  local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = name, link = false })
+  local color = ok and (hl.bg or hl.fg) or nil
+  if not color then
+    local ok_normal, normal = pcall(vim.api.nvim_get_hl, 0, { name = "Normal", link = false })
+    color = name == "TermdCursor" and ok_normal and normal.fg or fallback
+  end
+  return ("#%06x%02x"):format(color, math.floor(strength * 255 + 0.5))
+end
+
+--- The last search pattern as `matchbufline` should take it, which
+--- ignores 'smartcase'; nil without 'hlsearch' showing.
+local function search_pattern()
+  local pattern = vim.fn.getreg("/")
+  if not vim.o.hlsearch or vim.v.hlsearch == 0 or pattern == "" then
+    return nil
+  end
+  if vim.o.ignorecase and vim.o.smartcase and pattern:gsub("\\.", ""):find("%u") then
+    pattern = "\\C" .. pattern
+  end
+  return pattern
+end
+
+--- Tell termd where the cursor and the search matches are, if that
+--- changed.
+local function send_marks(s)
+  local win, pwin = source_win(s), page_win(s)
+  if not (s.can_marks and s.map and #s.map > 1 and win and pwin) then
+    return
+  end
+  local buf = s.buf
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local lnum, col = cursor[1], cursor[2]
+  local text = vim.api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
+  local char = text:sub(col + 1):match("^[%z\1-\127\194-\244][\128-\191]*") or ""
+  local at = vim.api.nvim_buf_get_offset(buf, lnum - 1) + col
+  local dark = vim.o.background == "dark"
+  local color = mark_color("TermdCursor", 0x7aa2f7, dark and 0.45 or 0.3)
+  local out = { ("cursor %s %d %d\n"):format(color, at, at + #char) }
+
+  local marks = {}
+  local pattern = search_pattern()
+  if pattern then
+    -- The lines the page shows, and as much again either side.
+    local top, bottom = vim.fn.line("w0", pwin) - 1, vim.fn.line("w$", pwin)
+    local height = bottom - top
+    local first = line_at(s, math.max(0, top - height))
+    local last = math.min(vim.api.nvim_buf_line_count(buf), line_at(s, bottom + height) + 1)
+    local ok, found = pcall(vim.fn.matchbufline, buf, pattern, first, last)
+    local search = mark_color("TermdSearch", 0xe0af68, dark and 0.4 or 0.45)
+    local current = mark_color("TermdCurSearch", 0xff9e64, dark and 0.65 or 0.6)
+    for _, m in ipairs(ok and found or {}) do
+      if #m.text > 0 and #marks < 1000 then
+        local from = vim.api.nvim_buf_get_offset(buf, m.lnum - 1) + m.byteidx
+        local on = m.lnum == lnum and m.byteidx <= col and col < m.byteidx + #m.text
+        marks[#marks + 1] = ("%s %d %d"):format(on and current or search, from, from + #m.text)
+      end
+    end
+  end
+  out[2] = "marks " .. table.concat(marks, " ") .. "\n"
+  local all = table.concat(out)
+  if all ~= s.sent_marks then
+    s.sent_marks = all
+    send(s, all)
+  end
+end
+
 -- Scrolling the page ----------------------------------------------------
 
 --- What a window needs to show the page and nothing else.
@@ -369,6 +462,9 @@ local MARK_GLYPHS = { [1] = "▘", [2] = "▖", [3] = "▌" }
 --- Mark the rows of the page that source line `lnum` takes, at its left
 --- edge, to the half of a row.
 local function mark(s, lnum)
+  if s.can_marks then
+    return -- termd shows the cursor itself
+  end
   if not (s.map and #s.map > 1 and vim.api.nvim_buf_is_valid(s.pbuf)) then
     return
   end
@@ -724,6 +820,7 @@ local function show_page(s, win)
   send_text(s)
   s.view = nil
   follow(s, true)
+  send_marks(s)
 end
 
 --- Take the page away, and the source shows.
@@ -766,6 +863,13 @@ local function handle(s, line)
   local kind, rest = line:match("^(%S+) ?(.*)$")
   if kind == "G" then
     M._write(rest)
+  elseif kind == "can" then
+    if rest:match("%f[%w]marks%f[%W]") then
+      s.can_marks = true
+      if vim.api.nvim_buf_is_valid(s.pbuf) then
+        vim.api.nvim_buf_clear_namespace(s.pbuf, mark_ns, 0, -1)
+      end
+    end
   elseif kind == "map" then
     local map, cell_h = {}, nil
     for number in rest:gmatch("%d+") do
@@ -793,6 +897,7 @@ local function handle(s, line)
       follow(s, true)
     end
     send_view(s)
+    send_marks(s)
   end
 end
 
@@ -928,6 +1033,19 @@ local function start(s)
     opts.group = s.group
     vim.api.nvim_create_autocmd(events, opts)
   end
+  -- After every command, when Neovim waits for the next: the cursor or the
+  -- search may have changed (`:noh` says so no other way). A moment later,
+  -- so that holding a key down does not render the page at every step.
+  local marks_later = debounced(s, 30, function()
+    send_marks(s)
+  end)
+  au("SafeState", {
+    callback = function()
+      if s.pwin then
+        marks_later()
+      end
+    end,
+  })
   au("CursorMoved", {
     buffer = buf,
     callback = function()
@@ -1179,6 +1297,8 @@ end
 
 local function define_highlights()
   vim.api.nvim_set_hl(0, "TermdCursor", { default = true, link = "Title" })
+  vim.api.nvim_set_hl(0, "TermdSearch", { default = true, link = "Search" })
+  vim.api.nvim_set_hl(0, "TermdCurSearch", { default = true, link = "CurSearch" })
   vim.api.nvim_set_hl(0, "TermdHiddenCursor", { blend = 100, nocombine = true })
 end
 
