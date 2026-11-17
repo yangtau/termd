@@ -73,6 +73,9 @@ pub struct Theme {
     pub paper: Rgb,
     /// What selected text stands on.
     pub select: Rgb,
+    /// What text found by a search stands on, and the occurrence moved to.
+    pub found: Rgb,
+    pub current: Rgb,
 }
 
 const DARK_BG: Rgb = Rgb(0x0d, 0x11, 0x17);
@@ -128,6 +131,8 @@ impl Theme {
             thumb: tint(0.3),
             paper,
             select: paper.mix(link, if dark { 0.38 } else { 0.26 }),
+            found: paper.mix(Rgb(0xf2, 0xc9, 0x4c), if dark { 0.3 } else { 0.45 }),
+            current: paper.mix(Rgb(0xf0, 0x88, 0x3e), if dark { 0.55 } else { 0.6 }),
         }
     }
 

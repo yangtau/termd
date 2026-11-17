@@ -130,6 +130,16 @@ impl Anchor {
     }
 }
 
+/// Where some text was found (see `Doc::find`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Found {
+    pub from: Pos,
+    pub to: Pos,
+    /// The page rows its lines take.
+    pub top: f32,
+    pub bottom: f32,
+}
+
 /// A place in the document's text: a character boundary in a text item.
 /// Ordered the way the document reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1047,40 +1057,157 @@ impl Doc {
             }
             let start = if index == from.item { from.offset } else { 0 };
             let end = if index == to.item { to.offset } else { u32::MAX };
-            for run in buf.layout_runs() {
-                let line_top = item.y + run.line_top;
-                if line_top >= bottom || line_top + run.line_height <= top {
-                    continue;
+            self.item_rects((item, x, buf, content), start..end, (top, bottom), true, &mut rects);
+        }
+        rects
+    }
+
+    /// The highlight for `range` of the text of one item, a rectangle per
+    /// line, as far as it shows between page offsets `rows`. With `clip`
+    /// cut to what a sideways scrolled table shows of it; without, where
+    /// it is with the table not scrolled.
+    fn item_rects(
+        &self,
+        (item, x, buf, content): (&Item, f32, &Buffer, &Content),
+        range: Range<u32>,
+        (top, bottom): (f32, f32),
+        clip: bool,
+        rects: &mut Vec<(u16, [f32; 4])>,
+    ) {
+        let Range { start, end } = range;
+        for run in buf.layout_runs() {
+            let line_top = item.y + run.line_top;
+            if line_top >= bottom || line_top + run.line_height <= top {
+                continue;
+            }
+            let line_start = content.line_starts.get(run.line_i).copied().unwrap_or(0);
+            let line_end = content.line_starts.get(run.line_i + 1).copied().unwrap_or(u32::MAX);
+            if line_start >= end || line_end <= start {
+                continue;
+            }
+            let glyphs = run.glyphs;
+            let selected = (0..glyphs.len())
+                .filter(|&i| line_start + (glyphs[i].start as u32) < end && line_start + glyphs[i].end as u32 > start);
+            let pad = CODE_PAD * buf.metrics().font_size;
+            let extent = selected.fold(None, |extent: Option<(f32, f32)>, i| {
+                let (g_lo, g_hi) = lit_extent(glyphs, i, pad);
+                let (lo, hi) = extent.unwrap_or((g_lo, g_hi));
+                Some((lo.min(g_lo), hi.max(g_hi)))
+            });
+            let (lo, hi) = match extent {
+                Some((lo, hi)) => (x + indent(buf, &run) + lo, x + indent(buf, &run) + hi),
+                // An empty line inside the selection still shows.
+                None if run.glyphs.is_empty() && line_start >= start && line_start < end => {
+                    (x, x + (0.4 * self.lay.em).round())
                 }
-                let line_start = content.line_starts.get(run.line_i).copied().unwrap_or(0);
-                let glyphs = run.glyphs;
-                let selected = (0..glyphs.len())
-                    .filter(|&i| line_start + (glyphs[i].start as u32) < end && line_start + glyphs[i].end as u32 > start);
-                let pad = CODE_PAD * buf.metrics().font_size;
-                let extent = selected.fold(None, |extent: Option<(f32, f32)>, i| {
-                    let (g_lo, g_hi) = lit_extent(glyphs, i, pad);
-                    let (lo, hi) = extent.unwrap_or((g_lo, g_hi));
-                    Some((lo.min(g_lo), hi.max(g_hi)))
+                None => continue,
+            };
+            // What a sideways scrolled table shows of it.
+            let (lo, hi) = match item.layer.checked_sub(1).and_then(|i| self.lay.tables.get(i as usize)) {
+                Some(t) if clip => ((lo - t.scroll).max(t.x), (hi - t.scroll).min(t.x + t.w)),
+                _ => (lo, hi),
+            };
+            if lo < hi {
+                rects.push((item.layer, [lo, line_top, hi - lo, run.line_height]));
+            }
+        }
+    }
+
+    /// Text item number `index`, if it is document content.
+    fn text_item(&self, index: u32) -> Option<(&Item, f32, &Buffer, &Content)> {
+        let item = self.lay.items.get(index as usize)?;
+        match &item.kind {
+            Kind::Text { x, buf, content: Some(content), .. } => Some((item, *x, buf, &**content)),
+            _ => None,
+        }
+    }
+
+    /// Where `query` occurs in the text, in reading order: where each
+    /// occurrence starts and ends, and the page rows its lines take. Case
+    /// does not matter unless the query has a capital letter (like Vim's
+    /// 'smartcase'). An occurrence stays inside one text item: a paragraph,
+    /// a table cell, a code block.
+    pub fn find(&self, query: &str) -> Vec<Found> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let fold = !query.chars().any(char::is_uppercase);
+        let needle: String = match fold {
+            true => query.chars().flat_map(char::to_lowercase).collect(),
+            false => query.to_string(),
+        };
+        let mut found = Vec::new();
+        for (index, item, _, buf, content) in self.texts() {
+            let text = buffer_text(buf);
+            let spans: Vec<(u32, u32)> = match fold {
+                true => {
+                    let (folded, origin) = fold_case(&text);
+                    let spans = folded.match_indices(&needle).map(|(at, _)| (origin[at], origin[at + needle.len()]));
+                    spans.filter(|(from, to)| from < to).collect()
+                }
+                false => text.match_indices(&needle).map(|(at, _)| (at as u32, (at + needle.len()) as u32)).collect(),
+            };
+            if spans.is_empty() {
+                continue;
+            }
+            // The text each line of the item shows, and its rows, in order.
+            let lines: Vec<(u32, u32, f32, f32)> = buf
+                .layout_runs()
+                .filter_map(|run| {
+                    let start = content.line_starts.get(run.line_i).copied().unwrap_or(0);
+                    let lo = run.glyphs.iter().map(|g| g.start).min()? as u32;
+                    let hi = run.glyphs.iter().map(|g| g.end).max()? as u32;
+                    Some((start + lo, start + hi, item.y + run.line_top, run.line_height))
+                })
+                .collect();
+            for (from, to) in spans {
+                let first = lines.partition_point(|line| line.1 <= from);
+                let on = lines[first..].iter().take_while(|line| line.0 < to);
+                let rows = on.fold(None, |rows: Option<(f32, f32)>, &(_, _, top, h)| match rows {
+                    Some((lo, hi)) => Some((lo.min(top), hi.max(top + h))),
+                    None => Some((top, top + h)),
                 });
-                let (lo, hi) = match extent {
-                    Some((lo, hi)) => (x + indent(buf, &run) + lo, x + indent(buf, &run) + hi),
-                    // An empty line inside the selection still shows.
-                    None if run.glyphs.is_empty() && line_start >= start && line_start < end => {
-                        (x, x + (0.4 * self.lay.em).round())
-                    }
-                    None => continue,
-                };
-                // What a sideways scrolled table shows of it.
-                let (lo, hi) = match item.layer.checked_sub(1).and_then(|i| self.lay.tables.get(i as usize)) {
-                    Some(t) => ((lo - t.scroll).max(t.x), (hi - t.scroll).min(t.x + t.w)),
-                    None => (lo, hi),
-                };
-                if lo < hi {
-                    rects.push((item.layer, [lo, line_top, hi - lo, run.line_height]));
+                if let Some((top, bottom)) = rows {
+                    let item = index as u32;
+                    let (from, to) = (Pos { item, offset: from }, Pos { item, offset: to });
+                    found.push(Found { from, to, top, bottom });
                 }
             }
         }
+        found
+    }
+
+    /// The highlight for text `from..to` of a single text item (an
+    /// occurrence found by `find`), a rectangle per line, each with its
+    /// layer. With `clip` as it shows (see `item_rects`).
+    pub fn match_rects(&self, from: Pos, to: Pos, clip: bool) -> Vec<(u16, [f32; 4])> {
+        let mut rects = Vec::new();
+        if let Some(text) = self.text_item(from.item) {
+            let end = if to.item == from.item { to.offset } else { u32::MAX };
+            self.item_rects(text, from.offset..end, (f32::MIN, f32::MAX), clip, &mut rects);
+        }
         rects
+    }
+
+    /// Scroll the table that text `from..to` (of one item) is in sideways,
+    /// if it scrolls, so that the text shows. Returns whether it moved.
+    pub fn reveal(&mut self, from: Pos, to: Pos) -> bool {
+        let rects = self.match_rects(from, to, false);
+        let Some(table) = rects.first().and_then(|(layer, _)| layer.checked_sub(1)) else { return false };
+        let Some(t) = self.lay.tables.get(table as usize) else { return false };
+        // Where the text is with the table not scrolled.
+        let lo = rects.iter().map(|(_, r)| r[0]).fold(f32::MAX, f32::min);
+        let hi = rects.iter().map(|(_, r)| r[0] + r[2]).fold(f32::MIN, f32::max);
+        let (left, right, margin) = (t.x + t.scroll, t.x + t.scroll + t.w, 2.0 * self.lay.em);
+        let by = if lo < left {
+            lo - margin - left
+        } else if hi > right {
+            // As far as the text needs, but not past its start.
+            (hi + margin - right).min(lo - margin - left)
+        } else {
+            return false;
+        };
+        self.scroll_table(table as usize, by)
     }
 
     /// The highlight for the text that comes from source bytes `from..to`,
@@ -2023,6 +2150,22 @@ fn buffer_text(buf: &Buffer) -> String {
     text
 }
 
+/// `text` in lower case, for finding text whatever its case, with the
+/// offset in `text` of the character each byte of it comes from (and one
+/// more entry for the end).
+fn fold_case(text: &str) -> (String, Vec<u32>) {
+    let mut folded = String::with_capacity(text.len());
+    let mut origin = Vec::with_capacity(text.len() + 1);
+    for (at, c) in text.char_indices() {
+        for lower in c.to_lowercase() {
+            folded.push(lower);
+            origin.extend(std::iter::repeat_n(at as u32, lower.len_utf8()));
+        }
+    }
+    origin.push(text.len() as u32);
+    (folded, origin)
+}
+
 /// The name a heading can be linked to with `#name`, the way GitHub derives
 /// it: lower case, punctuation dropped, spaces as hyphens, and a number
 /// appended if `taken` already has it.
@@ -2909,6 +3052,62 @@ Last &amp; final paragraph.
         assert!(doc.selection_rects(from, to, 0.0, doc.height() as f32).is_empty());
         // Beside the table, at the height of its rows, nothing is "inside".
         assert!(!doc.hit(t.x - 5.0, y).unwrap().inside);
+    }
+
+    #[test]
+    fn finds_text_ignoring_case_unless_asked() {
+        let Some(mut eng) = engine() else { return };
+        let doc = layout(&mut eng, "# Straße\n\nThe **straße** and STRASSE, ÉTÉ été.\n\n```\nlet straße = 1;\n```\n", 600);
+        let found = |query: &str| -> Vec<String> {
+            doc.find(query).into_iter().map(|f| doc.selected_text(f.from, f.to)).collect()
+        };
+        // In the heading, through bold, in code; not across the markup.
+        assert_eq!(found("straße"), ["Straße", "straße", "straße"]);
+        assert_eq!(found("Straße"), ["Straße"], "a capital letter: case matters");
+        assert_eq!(found("été"), ["ÉTÉ", "été"]);
+        assert!(found("**").is_empty());
+        assert!(found("").is_empty());
+        // Each is lit up where it is on the page, and only there.
+        for f in doc.find("straße") {
+            let rects = doc.match_rects(f.from, f.to, true);
+            assert_eq!(rects.len(), 1);
+            assert_eq!(rects, doc.selection_rects(f.from, f.to, 0.0, doc.height() as f32));
+            let [_, y, _, h] = rects[0].1;
+            assert_eq!((f.top, f.bottom), (y, y + h));
+        }
+        // Later lines of a code block and of a wrapped paragraph, where they are.
+        let words = (0..60).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let code = (0..50).map(|i| format!("line{i} = {i};")).collect::<Vec<_>>().join("\n");
+        let doc = layout(&mut eng, &format!("{words}\n\n```\n{code}\n```\n"), 300);
+        for needle in ["w57", "line42 ", "line7 "] {
+            let found = doc.find(needle);
+            assert_eq!(found.len(), 1, "{needle}");
+            let f = found[0];
+            let (x, y) = find(&doc, needle.trim());
+            let rects = doc.match_rects(f.from, f.to, true);
+            assert!(rects.iter().any(|&(_, r)| within(r, (x, y))), "{needle}: {rects:?} at {x}, {y}");
+            assert!(f.top < y && y < f.bottom, "{needle}: {f:?} at {y}");
+        }
+    }
+
+    #[test]
+    fn found_text_in_a_table_is_scrolled_into_view() {
+        let Some(mut eng) = engine() else { return };
+        let mut doc = layout(&mut eng, &table(30, 3), 1600);
+        let t = doc.tables()[0];
+        let Found { from, to, .. } = doc.find("word29x2")[0];
+        // Out of sight: nothing shows, but it has a place in the table.
+        assert!(doc.match_rects(from, to, true).is_empty());
+        assert_eq!(doc.match_rects(from, to, false).len(), 1);
+        assert!(doc.reveal(from, to));
+        let rects = doc.match_rects(from, to, true);
+        let [x, _, w, _] = rects[0].1;
+        assert!(x >= t.x && x + w <= t.x + t.w, "{rects:?} in {t:?}");
+        assert!(!doc.reveal(from, to), "it shows already");
+        // Back to the first column.
+        let Found { from, to, .. } = doc.find("word0x0")[0];
+        assert!(doc.reveal(from, to));
+        assert_eq!(doc.tables()[0].scroll, 0.0);
     }
 
     #[test]

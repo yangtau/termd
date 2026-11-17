@@ -1,12 +1,12 @@
 //! The interactive viewer: shows the page through the terminal's image
 //! protocol and reacts to keys, the mouse and changes of the file.
 
-use crate::doc::{Doc, Engine, LayoutOpts, Pos, TableBox};
+use crate::doc::{Doc, Engine, Found, LayoutOpts, Pos, TableBox};
 use crate::theme::Theme;
 use crate::term::Probe;
 use crate::{Cli, Trace, base_dir, body_px, kitty, modified, open, read_source};
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::{cursor, execute, terminal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -20,10 +20,11 @@ const TILE_H: u32 = 512;
 const KEEP_TILES: u32 = 16;
 /// Image ids from here on are the tiles of sideways scrolling tables, a
 /// block of ids per table; page tiles count up from 1.
-const TABLE_ID: u32 = 0x2000_0000;
+const TABLE_ID: u32 = 0x0400_0000;
 const TABLE_IDS: u32 = 4096;
-/// Added to the id of a tile for its highlighted variant.
-const LIT_ID: u32 = 0x1000_0000;
+/// Added to the id of a tile, times the number of its `Look`, for the
+/// variants that stand on a highlight color.
+const LOOK_ID: u32 = 0x0800_0000;
 /// Interval between frames of a scroll animation.
 const FRAME: Duration = Duration::from_millis(8);
 /// Time constant of the scroll animation: each frame covers a fixed fraction
@@ -141,15 +142,38 @@ struct Tile {
     /// 0 for the page, else the table's number (see `doc::TableBox::layer`).
     layer: u16,
     index: u32,
-    /// The same pixels on the selection color. Selected text is shown by
-    /// putting crops of this on top of the page, so that highlighting is a
-    /// matter of placements, like everything else that moves.
-    lit: bool,
+    look: Look,
+}
+
+/// What a tile's pixels stand on: nothing (the page as it is), or the
+/// color of a highlight. Selected or found text is shown by putting crops
+/// of a highlighted variant on top of the page, so that highlighting is a
+/// matter of placements, like everything else that moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Look {
+    Plain,
+    Selected,
+    Found,
+    /// The occurrence of a search moved to last.
+    Current,
+}
+
+impl Look {
+    const ALL: [Look; 4] = [Look::Plain, Look::Selected, Look::Found, Look::Current];
+
+    fn ground(self, theme: &Theme) -> Option<crate::theme::Rgb> {
+        match self {
+            Look::Plain => None,
+            Look::Selected => Some(theme.select),
+            Look::Found => Some(theme.found),
+            Look::Current => Some(theme.current),
+        }
+    }
 }
 
 impl Tile {
     fn page(index: u32) -> Tile {
-        Tile { layer: 0, index, lit: false }
+        Tile { layer: 0, index, look: Look::Plain }
     }
 
     fn id(self) -> u32 {
@@ -157,7 +181,7 @@ impl Tile {
             0 => self.index + 1,
             table => TABLE_ID + (table as u32 - 1) * TABLE_IDS + self.index % TABLE_IDS,
         };
-        if self.lit { id + LIT_ID } else { id }
+        id + self.look as u32 * LOOK_ID
     }
 }
 
@@ -184,8 +208,8 @@ struct Frame {
 /// Rows of a layer to put on the screen.
 struct Show {
     layer: u16,
-    /// From the highlighted variant of the layer's tiles.
-    lit: bool,
+    /// Which variant of the layer's tiles.
+    look: Look,
     /// Page rows, from and to.
     rows: (u32, u32),
     /// Screen row for the first of them; rows that end up above the
@@ -196,6 +220,25 @@ struct Show {
     crop: Option<(u32, u32, u32)>,
     placement: u32,
     z: i32,
+}
+
+/// Text found by `/`.
+#[derive(Clone)]
+struct Search {
+    query: String,
+    /// The occurrences in reading order.
+    found: Vec<Found>,
+    /// The one moved to last.
+    current: Option<usize>,
+}
+
+/// A search being typed in the status bar.
+struct Prompt {
+    text: String,
+    /// What a cancelled search goes back to: the search before it, and
+    /// where the page was.
+    before: Option<Search>,
+    scroll: f64,
 }
 
 /// What the mouse pointer is over.
@@ -261,6 +304,11 @@ pub struct Viewer {
     flash: Option<((Pos, Pos), Instant)>,
     /// The code block copied last, and when.
     copied: Option<(usize, Instant)>,
+    search: Option<Search>,
+    /// What was searched for last, for `n` and an empty search after the
+    /// search was cleared.
+    last_query: Option<String>,
+    prompt: Option<Prompt>,
     sprites: kitty::Sprites,
 }
 
@@ -313,6 +361,9 @@ impl Viewer {
             hover: Hover::Nothing,
             flash: None,
             copied: None,
+            search: None,
+            last_query: None,
+            prompt: None,
             sprites: kitty::Sprites::default(),
         };
         // Show the top of the page before anything else is laid out.
@@ -415,6 +466,9 @@ impl Viewer {
         let line = (self.geom.cell_h * 2) as f64;
         let page = self.geom.view_h() as f64;
         let delta = match ev {
+            Event::Key(key) if key.kind != KeyEventKind::Release && self.prompt.is_some() => {
+                return Ok(self.prompt_key(key));
+            }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
@@ -422,6 +476,17 @@ impl Viewer {
                         self.selection = None;
                         return Ok(Action::Redraw);
                     }
+                    KeyCode::Esc if self.search.is_some() => {
+                        self.search = None;
+                        return Ok(Action::Redraw);
+                    }
+                    KeyCode::Char('/') => {
+                        let (before, scroll) = (self.search.clone(), self.target);
+                        self.prompt = Some(Prompt { text: String::new(), before, scroll });
+                        return Ok(Action::Redraw);
+                    }
+                    KeyCode::Char('n') => return Ok(self.next(true)),
+                    KeyCode::Char('N') => return Ok(self.next(false)),
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
                     KeyCode::Char('c') if ctrl => return Ok(Action::Quit),
                     KeyCode::Char('j') | KeyCode::Down | KeyCode::Enter => line,
@@ -717,6 +782,144 @@ impl Viewer {
         self.copy_code(after_last.unwrap_or(first), fenced)
     }
 
+    /// A key pressed while a search is typed.
+    fn prompt_key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(prompt) = &mut self.prompt else { return Action::None };
+        let text = &mut prompt.text;
+        match key.code {
+            KeyCode::Enter => return self.confirm_search(),
+            KeyCode::Esc => return self.cancel_search(),
+            KeyCode::Char('c') if ctrl => return self.cancel_search(),
+            KeyCode::Backspace if text.is_empty() => return self.cancel_search(),
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Char('u') if ctrl => text.clear(),
+            KeyCode::Char('w') if ctrl => {
+                let word = text.trim_end().trim_end_matches(|c: char| !c.is_whitespace()).len();
+                text.truncate(word);
+            }
+            KeyCode::Char(c) if !ctrl => text.push(c),
+            _ => return Action::None,
+        }
+        self.search_as_typed();
+        Action::Redraw
+    }
+
+    /// Show what the search typed so far finds: all of it lit up, and the
+    /// first occurrence from where the page was when the search began
+    /// brought into view.
+    fn search_as_typed(&mut self) {
+        let Some(prompt) = &self.prompt else { return };
+        let (query, origin) = (prompt.text.clone(), prompt.scroll);
+        if query.is_empty() {
+            self.search = None;
+            self.scroll_by(origin - self.target);
+            return;
+        }
+        let found = self.find(&query);
+        let current = found.iter().position(|f| f.top as f64 >= origin).or((!found.is_empty()).then_some(0));
+        self.search = Some(Search { query, found, current });
+        match current {
+            Some(i) => self.go_to(i),
+            None => {
+                self.scroll_by(origin - self.target);
+            }
+        }
+    }
+
+    /// Enter: keep what the search found. An empty search repeats the one
+    /// before, like Vim's.
+    fn confirm_search(&mut self) -> Action {
+        let Some(prompt) = self.prompt.take() else { return Action::None };
+        if prompt.text.is_empty() {
+            self.search = prompt.before;
+            return self.next(true);
+        }
+        self.last_query = Some(prompt.text);
+        if let Some(search) = self.search.as_ref().filter(|s| s.found.is_empty()) {
+            self.notify(format!("not found: {}", search.query));
+        }
+        Action::Redraw
+    }
+
+    /// Esc: back to the search before and to where the page was.
+    fn cancel_search(&mut self) -> Action {
+        let Some(prompt) = self.prompt.take() else { return Action::None };
+        self.search = prompt.before;
+        self.scroll_by(prompt.scroll - self.target);
+        Action::Redraw
+    }
+
+    /// Every occurrence of `query` and where it is on the page. The rest
+    /// of the document is laid out for it.
+    fn find(&mut self, query: &str) -> Vec<Found> {
+        self.doc.advance(&mut self.engine, None, None);
+        self.doc.find(query)
+    }
+
+    /// `search` again on a new layout, where the old places mean nothing.
+    fn search_again(&mut self, search: Search) -> Search {
+        let found = self.find(&search.query);
+        // The same occurrence, as far as can be told.
+        let current = search.current.filter(|_| found.len() == search.found.len());
+        Search { query: search.query, found, current }
+    }
+
+    /// Go to the next occurrence of the search, or with `forward` false the
+    /// one before: next to the current one if that is in view, else the
+    /// first one from the top of the view, or the last one above its bottom.
+    fn next(&mut self, forward: bool) -> Action {
+        // A cleared search comes back.
+        if let (None, Some(query)) = (&self.search, self.last_query.clone()) {
+            let found = self.find(&query);
+            self.search = Some(Search { query, found, current: None });
+        }
+        let Some(search) = &self.search else { return Action::Redraw };
+        let n = search.found.len();
+        if n == 0 {
+            self.notify(format!("not found: {}", search.query));
+            return Action::Redraw;
+        }
+        let (top, bottom) = (self.target as f32, (self.target + self.geom.view_h() as f64) as f32);
+        let shows = |f: &Found| f.bottom > top && f.top < bottom;
+        let next = match search.current.filter(|&i| shows(&search.found[i])) {
+            Some(i) if forward => (i + 1 < n).then_some(i + 1),
+            Some(i) => i.checked_sub(1),
+            None if forward => search.found.iter().position(|f| f.top >= top),
+            None => search.found.iter().rposition(|f| f.top < bottom),
+        };
+        let i = match next {
+            Some(i) => i,
+            None if forward => {
+                self.notify("search wrapped around to the top");
+                0
+            }
+            None => {
+                self.notify("search wrapped around to the bottom");
+                n - 1
+            }
+        };
+        self.go_to(i);
+        Action::Redraw
+    }
+
+    /// Make occurrence `i` of the search the current one and bring it
+    /// into view, a third down the screen if it was not.
+    fn go_to(&mut self, i: usize) {
+        let Some(search) = &mut self.search else { return };
+        search.current = Some(i);
+        let f = search.found[i];
+        self.doc.reveal(f.from, f.to);
+        let (view_h, cell_h) = (self.geom.view_h() as f64, self.geom.cell_h as f64);
+        // Not right at an edge, where a held table header may cover it.
+        let shows = f.top as f64 >= self.target + cell_h && f.bottom as f64 <= self.target + view_h - cell_h;
+        if !shows {
+            self.scroll_by(f.top as f64 - view_h / 3.0 - self.target);
+        }
+    }
+
     /// Scroll a table sideways by `cells` character cells: the one under
     /// the pointer if that scrolls, else the first one in view that does.
     fn scroll_table(&mut self, cells: f64) -> Action {
@@ -742,7 +945,7 @@ impl Viewer {
         let deadline = Instant::now() + WORK_SLICE;
         for (top, bottom) in self.doc.highlight(&mut self.engine, Some(deadline)) {
             for index in top / TILE_H..=bottom.saturating_sub(1) / TILE_H {
-                for tile in [Tile::page(index), Tile { lit: true, ..Tile::page(index) }] {
+                for tile in Look::ALL.map(|look| Tile { look, ..Tile::page(index) }) {
                     self.sent.remove(&tile);
                     visible |= self.placed.iter().any(|(placed, _)| *placed == tile);
                 }
@@ -855,6 +1058,13 @@ impl Viewer {
         // Places in the old layout mean nothing in the new one.
         (self.selection, self.dragging, self.autoscroll) = (None, false, 0.0);
         (self.flash, self.copied, self.hover) = (None, None, Hover::Nothing);
+        if let Some(search) = self.search.take() {
+            self.search = Some(self.search_again(search));
+        }
+        if let Some(mut prompt) = self.prompt.take() {
+            prompt.before = prompt.before.map(|before| self.search_again(before));
+            self.prompt = Some(prompt);
+        }
     }
 
     fn max_scroll(&self) -> u32 {
@@ -921,8 +1131,8 @@ impl Viewer {
         let area = self.area(tile).unwrap_or(Area { x: 0, y: 0, w: 0, h: 0 });
         self.sent.insert(tile, area);
         if area.h > 0 {
-            let (layer, lit) = (tile.layer, tile.lit);
-            let pixels = self.doc.render(&mut self.engine, layer, area.x, area.y, area.w, area.h, lit);
+            let (layer, ground) = (tile.layer, tile.look.ground(&self.theme));
+            let pixels = self.doc.render_on(&mut self.engine, layer, area.x, area.y, area.w, area.h, ground);
             self.uploader.transmit(out, tile.id(), area.w, area.h, &pixels);
         }
         area
@@ -946,7 +1156,7 @@ impl Viewer {
             return;
         }
         for index in (from - top) / TILE_H..=(to - 1 - top) / TILE_H {
-            let tile = Tile { layer: show.layer, index, lit: show.lit };
+            let tile = Tile { layer: show.layer, index, look: show.look };
             let area = match self.sent.get(&tile) {
                 Some(area) => *area,
                 None if frame.rendered && !self.placed.contains(&(tile, show.placement)) => {
@@ -1036,25 +1246,27 @@ impl Viewer {
 
         // The page, then the sideways scrolling tables that sit in it, each
         // cropped to how far it is scrolled.
-        let page = Show { layer: 0, lit: false, rows: (scroll, view_end), at: 0, crop: None, placement: 1, z: 0 };
+        let page = Show { layer: 0, look: Look::Plain, rows: (scroll, view_end), at: 0, crop: None, placement: 1, z: 0 };
         self.show(&mut frame, &page);
         let tables: Vec<TableBox> = self.scrolling_tables(scroll).map(|(_, t)| *t).collect();
         for t in &tables {
             let rows = ((t.y.floor() as u32).max(scroll), ((t.y + t.h).ceil() as u32).min(view_end));
             let crop = Some(((t.x + t.scroll) as u32, t.w as u32, t.x as u32));
             let at = rows.0 as i64 - scroll as i64;
-            self.show(&mut frame, &Show { layer: t.layer, lit: false, rows, at, crop, placement: 1, z: 0 });
+            self.show(&mut frame, &Show { layer: t.layer, look: Look::Plain, rows, at, crop, placement: 1, z: 0 });
         }
-        // What is highlighted (the selection, something just copied): the
-        // same place again from the tiles' highlighted variant, on top.
-        for (n, (layer, area)) in self.highlights(scroll).into_iter().enumerate() {
+        // What is highlighted (what a search found, the selection, something
+        // just copied): the same place again from the tiles' variant on the
+        // highlight's color, on top; the selection over what was found.
+        for (n, (layer, look, area)) in self.highlights(scroll).into_iter().enumerate() {
             let [x, y, w, h] = area.map(|v| v.round().max(0.0) as u32);
             let rows = (y.max(scroll), (y + h).min(view_end));
             // A sideways scrolled table shows a later part of itself.
             let shift = layer.checked_sub(1).and_then(|t| self.doc.tables().get(t as usize)).map_or(0.0, |t| t.scroll);
             let crop = Some((x + shift as u32, w, x));
             let at = rows.0 as i64 - scroll as i64;
-            self.show(&mut frame, &Show { layer, lit: true, rows, at, crop, placement: n as u32 + 1, z: 1 });
+            let z = if look == Look::Selected { 2 } else { 1 };
+            self.show(&mut frame, &Show { layer, look, rows, at, crop, placement: n as u32 + 1, z });
         }
         // Headers held at the top: the same pixels, placed a second time
         // above everything else.
@@ -1062,7 +1274,7 @@ impl Viewer {
         for (t, at) in &held {
             let rows = (t.y.floor() as u32, (t.y + t.head_h).ceil() as u32);
             let crop = Some(((t.x + t.scroll) as u32, t.w as u32, t.x as u32));
-            self.show(&mut frame, &Show { layer: t.layer, lit: false, rows, at: *at, crop, placement: 2, z: 3 });
+            self.show(&mut frame, &Show { layer: t.layer, look: Look::Plain, rows, at: *at, crop, placement: 2, z: 4 });
         }
 
         for &(tile, placement) in self.placed.difference(&frame.placed) {
@@ -1101,12 +1313,22 @@ impl Viewer {
     }
 
     /// The parts of the page to show highlighted in the viewport starting
-    /// at page offset `scroll`, as (layer, [x, y, width, height]): the
-    /// selection, and what was copied a moment ago.
-    fn highlights(&self, scroll: u32) -> Vec<(u16, [f32; 4])> {
+    /// at page offset `scroll`, as (layer, look, [x, y, width, height]):
+    /// what a search found, the selection, and what was copied a moment ago.
+    fn highlights(&self, scroll: u32) -> Vec<(u16, Look, [f32; 4])> {
         let (top, bottom) = (scroll as f32, (scroll + self.geom.view_h()) as f32);
+        let mut lit = Vec::new();
+        if let Some(search) = &self.search {
+            let shown = search.found.iter().enumerate().filter(|(_, f)| f.top < bottom && f.bottom > top);
+            for (i, f) in shown {
+                let look = if search.current == Some(i) { Look::Current } else { Look::Found };
+                lit.extend(self.doc.match_rects(f.from, f.to, true).into_iter().map(|(layer, r)| (layer, look, r)));
+            }
+        }
         let spans = self.flash.map(|(span, _)| span).into_iter().chain(self.selected());
-        spans.flat_map(|(from, to)| self.doc.selection_rects(from, to, top, bottom)).collect()
+        let selected = spans.flat_map(|(from, to)| self.doc.selection_rects(from, to, top, bottom));
+        lit.extend(selected.map(|(layer, r)| (layer, Look::Selected, r)));
+        lit
     }
 
     /// The solid rectangles to show on top of the page, for the viewport
@@ -1117,7 +1339,7 @@ impl Viewer {
         for (t, at) in held {
             let top = scroll as f32 + (*at).max(0) as f32;
             let height = t.head_h + (*at).min(0) as f32;
-            rects.extend(self.screen_rect([t.x, top, t.w, height], scroll, self.theme.paper.opaque(), 2));
+            rects.extend(self.screen_rect([t.x, top, t.w, height], scroll, self.theme.paper.opaque(), 3));
         }
         // A scroll bar along the bottom of a sideways scrolling table, or
         // along the bottom of the viewport while the table goes on below.
@@ -1127,7 +1349,7 @@ impl Viewer {
             let length = (t.w * t.w / t.full_w).max(4.0 * thick);
             let x = t.x + (t.w - length) * t.scroll / (t.full_w - t.w).max(1.0);
             let thumb = self.theme.solid(self.theme.thumb);
-            rects.extend(self.screen_rect([x, bottom, length, thick], scroll, thumb, 4));
+            rects.extend(self.screen_rect([x, bottom, length, thick], scroll, thumb, 5));
         }
         rects
     }
@@ -1158,17 +1380,50 @@ impl Viewer {
             (true, 0) => "100%".to_string(),
             (true, max) => format!("{}%", (self.target.round() as u64 * 100 / max as u64).min(100)),
         };
+        // How the search is doing, before the position.
+        let count = self.search.as_ref().map(|s| match (s.found.len(), s.current) {
+            (0, _) => "not found".to_string(),
+            (n, Some(i)) => format!("{}/{n}", i + 1),
+            (n, None) => format!("{n} found"),
+        });
+        let right = match count {
+            Some(count) => format!("{count}   {position}"),
+            None => position,
+        };
+        let right_w = right.chars().count();
+        let room = cols.saturating_sub(right_w + 3);
+        let left = match &self.prompt {
+            // The search being typed, in full strength, with a block for a
+            // cursor; its end if it does not fit.
+            Some(prompt) => {
+                let chars = prompt.text.chars().count();
+                let text: String = prompt.text.chars().skip((chars + 3).saturating_sub(room)).collect();
+                format!("\x1b[22m /{text}\x1b[7m \x1b[27m\x1b[2m")
+            }
+            None => self.status_left(room),
+        };
+        let status = format!("{left}\x1b[{}G{right}", cols.saturating_sub(right_w));
+        if status != self.status {
+            let _ = write!(out, "\x1b[{};1H\x1b[0m\x1b[2K\x1b[2m{status}\x1b[0m", self.geom.rows);
+            self.status = status;
+        }
+    }
+
+    /// The status bar left of the position, in `room` columns: the file
+    /// and line, then a message, where the link under the pointer leads,
+    /// the search, or what the keys do.
+    fn status_left(&self, room: usize) -> String {
         let name = self.path.file_name().unwrap_or(self.path.as_os_str()).to_string_lossy();
         // The source line at the top of the viewport, as an editor would name it.
         let name = match self.doc.source_line(self.target as u32) {
             Some(line) => format!("{name}:{line}"),
             None => name.to_string(),
         };
-        let hints = match self.scrolling_tables(self.scroll.round() as u32).next() {
-            Some(_) => "j/k scroll · h/l or shift+wheel scroll the table · e edit · y copy code · q quit",
-            None => "j/k scroll · space/b page · e edit · y copy code · drag to select · q quit",
+        let hints = match (&self.search, self.scrolling_tables(self.scroll.round() as u32).next()) {
+            (Some(search), _) => format!("/{} · n/N next/previous · / search · Esc clear", search.query),
+            (None, Some(_)) => "j/k scroll · h/l or shift+wheel scroll the table · / search · e edit · q quit".into(),
+            (None, None) => "j/k scroll · space/b page · / search · e edit · y copy code · q quit".into(),
         };
-        // A message first, then where the link under the pointer leads.
         let link = match self.hover {
             Hover::Link(link) => self.doc.link(link),
             _ => None,
@@ -1178,16 +1433,9 @@ impl Viewer {
             (None, Some(target)) => format!(" {name}   → {target}"),
             (None, None) => format!(" {name}   {hints}"),
         };
-        let room = cols.saturating_sub(position.chars().count() + 3);
-        let left: String = if left.chars().count() <= room {
-            left
-        } else {
-            format!(" {name}").chars().take(room).collect()
-        };
-        let status = format!("{left}\x1b[{}G{position}", cols.saturating_sub(position.chars().count()));
-        if status != self.status {
-            let _ = write!(out, "\x1b[{};1H\x1b[0m\x1b[2K\x1b[2m{status}\x1b[0m", self.geom.rows);
-            self.status = status;
+        match left.chars().count() <= room {
+            true => left,
+            false => format!(" {name}").chars().take(room).collect(),
         }
     }
 }
