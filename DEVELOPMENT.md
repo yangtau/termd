@@ -66,7 +66,8 @@ termd（`--serve`）只负责排版、按需渲染进入视野的那几块，再
 `nix develop` 进入带 Rust 工具链的开发环境。
 
 `.github/workflows/nix.yml` 在每次推送到 main、推送 `v*` 标签和 PR 时，在 Linux x86_64 和
-macOS arm64 上执行 `nix build`，并把结果推送到 Cachix（需要仓库 secret `CACHIX_AUTH_TOKEN`）。
+macOS arm64 上执行 `nix build`；main 和标签的结果推送到 Cachix（需要仓库 secret `CACHIX_AUTH_TOKEN`），
+PR 只读缓存。缓存读写失败都不会让构建失败。
 
 发布新版本：改 `Cargo.toml` 里的 `version`，提交到 main，然后打同名标签：
 

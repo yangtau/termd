@@ -2,6 +2,8 @@ name: Nix
 
 # 在 Linux x86_64 和 macOS arm64 上构建 flake，并把结果推送到 tau.cachix.org。
 # Nix 的构建结果只取决于源码，所以 main 上构建过的提交，之后打的标签也能直接命中缓存。
+# 缓存只是加速，不能让构建失败：读缓存失败就自己构建（fallback），推送失败不影响结果。
+# 只有 main 和标签推送，PR 只读。
 on:
   push:
     branches: [main]
@@ -9,27 +11,44 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# 同一分支上新的推送取消还在跑的旧构建。
+concurrency:
+  group: nix-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build ${{ matrix.system }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             system: x86_64-linux
-          - os: macos-latest # Apple Silicon
+          - os: macos-15 # Apple Silicon
             system: aarch64-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            fallback = true
+            connect-timeout = 10
+            download-attempts = 3
 
       - uses: cachix/cachix-action@v16
+        # 也作用于推送缓存的 post 步骤
+        continue-on-error: true
         with:
           name: tau
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
           # 只推送 termd 本身，不推送 nixpkgs 里本来就能从 cache.nixos.org 下载的依赖
           pushFilter: '(-source$|\.tar\.gz$|-vendor-staging$|cargo-vendor-dir$)'
 
